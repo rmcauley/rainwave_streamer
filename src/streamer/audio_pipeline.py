@@ -3,6 +3,8 @@ import math
 from typing import Callable, Iterator
 import itertools
 import time
+from dataclasses import dataclass
+from collections import deque
 
 import av
 from av.audio.resampler import AudioResampler
@@ -25,8 +27,9 @@ class AudioPipeline:
         self, config: StreamConfig, *, ahead_buffer_ms: int = ahead_buffer_ms_default
     ) -> None:
         self._config = config
-        self._tail_samples = int(sample_rate * max(crossfade_seconds, buffer_seconds))
-        self._tail: np.ndarray | None = None
+        self._buffer_samples = int(sample_rate * max(crossfade_seconds, buffer_seconds))
+        self._queue: deque[np.ndarray] = deque()
+        self._queue_samples: int = 0
         self._realtime_start: float | None = None
         self._realtime_samples_sent = 0
         self._ahead_buffer_seconds = max(0.0, ahead_buffer_ms / 1000.0)
@@ -61,29 +64,42 @@ class AudioPipeline:
             encoder.close()
         self._realtime_start = None
         self._realtime_samples_sent = 0
+        self._clear_queue()
 
-    def _push_samples(self, samples: np.ndarray) -> Iterator[np.ndarray]:
-        if self._tail is None:
-            self._tail = samples
+    def _enqueue_samples(self, samples: np.ndarray) -> Iterator[np.ndarray]:
+        if samples.shape[1] == 0:
             return iter(())
+        self._queue.append(samples)
+        self._queue_samples += samples.shape[1]
+        return self._dequeue_ready()
 
-        combined = np.concatenate([self._tail, samples], axis=1)
+    def _dequeue_ready(self) -> Iterator[np.ndarray]:
+        ready: list[np.ndarray] = []
+        while self._queue_samples > self._buffer_samples:
+            excess = self._queue_samples - self._buffer_samples
+            head = self._queue[0]
+            if head.shape[1] <= excess:
+                ready.append(head)
+                self._queue.popleft()
+                self._queue_samples -= head.shape[1]
+            else:
+                emit = head[:, :excess]
+                keep = head[:, excess:]
+                ready.append(emit)
+                self._queue[0] = keep
+                self._queue_samples -= excess
+        return iter(ready)
 
-        if combined.shape[1] <= self._tail_samples:
-            self._tail = combined
-            return iter(())
+    def _peek_queue(self) -> np.ndarray:
+        if not self._queue:
+            return np.zeros((channels, 0), dtype=np.float32)
+        if len(self._queue) == 1:
+            return self._queue[0]
+        return np.concatenate(list(self._queue), axis=1)
 
-        split = combined.shape[1] - self._tail_samples
-        ready = combined[:, :split]
-        self._tail = combined[:, split:]
-        return iter((ready,))
-
-    def _drain_tail(self) -> Iterator[np.ndarray]:
-        if self._tail is None:
-            return iter(())
-        ready = self._tail
-        self._tail = None
-        return iter((ready,))
+    def _clear_queue(self) -> None:
+        self._queue.clear()
+        self._queue_samples = 0
 
     def _trim_silence(
         self, samples: np.ndarray, threshold_db: float = -60.0
@@ -114,7 +130,7 @@ class AudioPipeline:
         if last_audible < samples.shape[1]:
             trimmed = samples.shape[1] - last_audible
             logging.debug(
-                f"Trimmed {trimmed} silent samples ({trimmed/sample_rate:.2f}s) from tail."
+                f"Trimmed {trimmed} silent samples ({trimmed/sample_rate:.2f}s) from buffer."
             )
             return samples[:, :last_audible]
 
@@ -216,7 +232,7 @@ class AudioPipeline:
     def _prefetch_head(
         self, frames: Iterator[np.ndarray]
     ) -> tuple[np.ndarray, Iterator[np.ndarray]]:
-        needed = self._tail_samples
+        needed = self._buffer_samples
         chunks: list[np.ndarray] = []
         collected = 0
 
@@ -241,6 +257,82 @@ class AudioPipeline:
 
         return head, frames
 
+    @dataclass
+    class _QueuedTrack:
+        track: TrackInfo
+        total_samples: int | None
+        head: np.ndarray
+        frames: Iterator[np.ndarray]
+
+    def _queue_next_track(
+        self, next_track_provider: Callable[[], TrackInfo | None]
+    ) -> _QueuedTrack | None:
+        next_track = next_track_provider()
+        if not next_track:
+            return None
+        logging.info(f"Next song queued: {next_track.title}")
+        next_total, raw_iter = self._open_track(next_track)
+        next_head, next_frames_iter = self._prefetch_head(raw_iter)
+        return self._QueuedTrack(
+            track=next_track,
+            total_samples=next_total,
+            head=next_head,
+            frames=next_frames_iter,
+        )
+
+    def _crossfade_to_next(
+        self, current_track: TrackInfo, queued: _QueuedTrack
+    ) -> bool:
+        buffered = self._peek_queue()
+
+        # Trim trailing silence before making any decisions.
+        buffered = self._trim_silence(buffered)
+
+        head = queued.head
+        length = min(buffered.shape[1], head.shape[1])
+        if length == 0:
+            return False
+
+        fade_out_smart = self._detect_fade(buffered, direction="out")
+        fade_in_smart = self._detect_fade(head, direction="in")
+
+        if fade_out_smart and fade_in_smart:
+            logging.info(
+                f"Crossfading (Buffer length: {buffered.shape[1]/sample_rate:.2f}s)"
+            )
+
+            curr_gain = math.pow(10.0, (gain_db + current_track.gain_db) / 20.0)
+            next_gain = math.pow(10.0, (gain_db + queued.track.gain_db) / 20.0)
+
+            mixed = self._mix_crossfade(buffered * curr_gain, head * next_gain)
+
+            self._mp3_conn.set_title(queued.track.title)
+            self._encode_samples_scaled(mixed)
+
+            self._clear_queue()
+            if length < head.shape[1]:
+                head_remainder = head[:, length:]
+                if head_remainder.shape[1] > 0:
+                    queued.frames = itertools.chain([head_remainder], queued.frames)
+            return True
+
+        return False
+
+    def _drain_queue_without_crossfade(self, *, gain_db: float) -> None:
+        logging.info("No crossfade. Draining queue (with silence trim).")
+        buffered = self._peek_queue()
+        buffered = self._trim_silence(buffered)
+        self._encode_samples(buffered, gain_db=gain_db)
+        self._clear_queue()
+
+    def _start_next_track(
+        self, queued: _QueuedTrack
+    ) -> tuple[TrackInfo, int | None, Iterator[np.ndarray]]:
+        self._mp3_conn.set_title(queued.track.title)
+        for ready in self._enqueue_samples(queued.head):
+            self._encode_samples(ready, gain_db=queued.track.gain_db)
+        return queued.track, queued.total_samples, queued.frames
+
     def stream_tracks(
         self, next_track_provider: Callable[[], TrackInfo | None]
     ) -> None:
@@ -258,104 +350,36 @@ class AudioPipeline:
             total_samples = current_total if current_total else 0
             samples_sent = 0
 
-            next_track: TrackInfo | None = None
-            next_head: np.ndarray | None = None
-            next_frames_iter: Iterator[np.ndarray] | None = None
-            next_total: int | None = None
+            queued_next: AudioPipeline._QueuedTrack | None = None
 
             # --- Main Processing Loop for Current Track ---
             for chunk in current_frames:
                 samples_sent += chunk.shape[1]
-                for ready in self._push_samples(chunk):
+                for ready in self._enqueue_samples(chunk):
                     self._encode_samples(ready, gain_db=current_track.gain_db)
 
                 if (
                     duration_known
-                    and next_track is None
-                    and (total_samples - samples_sent) <= (self._tail_samples * 1.5)
+                    and queued_next is None
+                    and (total_samples - samples_sent) <= (self._buffer_samples * 1.5)
                 ):
-                    next_track = next_track_provider()
-                    if next_track:
-                        logging.info(f"Next song queued: {next_track.title}")
-                        next_total, raw_iter = self._open_track(next_track)
-                        next_head, next_frames_iter = self._prefetch_head(raw_iter)
+                    queued_next = self._queue_next_track(next_track_provider)
 
             # --- Crossfade Decision ---
-            crossfade_occured = False
-
-            if (
-                duration_known
-                and next_track
-                and next_head is not None
-                and next_frames_iter is not None
-            ):
-                tail = (
-                    self._tail
-                    if self._tail is not None
-                    else np.zeros((channels, 0), dtype=np.float32)
-                )
-
-                # 1. TRIM SILENCE: This is key. We remove trailing zeros.
-                # If the song had 4s of silence at the end, 'tail' is now 4s shorter.
-                tail = self._trim_silence(tail)
-
-                # 2. DECIDE: Smart detect or just always crossfade?
-                # Even if detection fails, a small crossfade is usually better than a hard cut.
-                fade_out_smart = self._detect_fade(tail, direction="out")
-                fade_in_smart = self._detect_fade(next_head, direction="in")
-
-                # If we have any audio left in tail after trimming, we crossfade.
-                if tail.shape[1] > 0 and fade_out_smart and fade_in_smart:
-                    logging.info(
-                        f"Crossfading (Tail length: {tail.shape[1]/sample_rate:.2f}s)"
-                    )
-
-                    curr_gain = math.pow(10.0, (gain_db + current_track.gain_db) / 20.0)
-                    next_gain = math.pow(10.0, (gain_db + next_track.gain_db) / 20.0)
-
-                    # Mix using the potentially shorter tail
-                    mixed = self._mix_crossfade(tail * curr_gain, next_head * next_gain)
-
-                    self._mp3_conn.set_title(next_track.title)
-                    self._encode_samples_scaled(mixed)
-
-                    self._tail = None
-                    current_track = next_track
-                    current_total = next_total
-                    current_frames = next_frames_iter
-                    crossfade_occured = True
-
-            if crossfade_occured:
-                continue
+            if duration_known and queued_next:
+                if self._crossfade_to_next(current_track, queued_next):
+                    current_track = queued_next.track
+                    current_total = queued_next.total_samples
+                    current_frames = queued_next.frames
+                    continue
 
             # --- No Crossfade / Fallback ---
-            # Even here, we trim silence. If we are just playing songs back-to-back,
-            # we don't want to broadcast 4 seconds of silence.
-            logging.info("No crossfade. Draining tail (with silence trim).")
+            self._drain_queue_without_crossfade(gain_db=current_track.gain_db)
 
-            # 1. Get the tail
-            tail = (
-                self._tail
-                if self._tail is not None
-                else np.zeros((channels, 0), dtype=np.float32)
-            )
-
-            # 2. Trim silence from it
-            tail = self._trim_silence(tail)
-
-            # 3. Play the trimmed tail
-            self._encode_samples(tail, gain_db=current_track.gain_db)
-            self._tail = None  # Clear buffer
-
-            if next_track and next_frames_iter:
-                # Play the pre-fetched head
-                self._mp3_conn.set_title(next_track.title)
-                for ready in self._push_samples(next_head):  # type: ignore
-                    self._encode_samples(ready, gain_db=next_track.gain_db)
-
-                current_track = next_track
-                current_total = next_total
-                current_frames = next_frames_iter
+            if queued_next:
+                current_track, current_total, current_frames = self._start_next_track(
+                    queued_next
+                )
             else:
                 current_track = next_track_provider()
                 if current_track:
