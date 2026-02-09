@@ -270,13 +270,44 @@ class AudioPipeline:
         ready = self._tail
         self._tail = None
         return iter((ready,))
+    
+    def _trim_silence(self, samples: np.ndarray, threshold_db: float = -60.0) -> np.ndarray:
+        """
+        Removes trailing silence from the end of the numpy array.
+        """
+        if samples.shape[1] == 0:
+            return samples
+
+        # Convert dB threshold to linear amplitude
+        threshold_linear = math.pow(10, threshold_db / 20)
+        
+        # Check absolute amplitude across all channels (max projection)
+        # We look for the last index where amplitude > threshold
+        amplitudes = np.max(np.abs(samples), axis=0)
+        
+        # Find indices where audio is audible
+        audible_indices = np.where(amplitudes > threshold_linear)[0]
+        
+        if len(audible_indices) == 0:
+            # The entire buffer is silence
+            return np.zeros((samples.shape[0], 0), dtype=np.float32)
+            
+        # The new end is the last audible sample + 1
+        last_audible = audible_indices[-1] + 1
+        
+        if last_audible < samples.shape[1]:
+            trimmed = samples.shape[1] - last_audible
+            logging.debug(f"Trimmed {trimmed} silent samples ({trimmed/self._config.sample_rate:.2f}s) from tail.")
+            return samples[:, :last_audible]
+            
+        return samples
 
     def _detect_fade(self, samples: np.ndarray, *, direction: str) -> bool:
-        if samples.shape[1] < self._tail_samples:
+        if samples.shape[1] < (self._config.sample_rate * 0.5): # Need at least 0.5s to judge fade
             return False
         
         # Analyze RMS energy
-        window = max(1, int(self._tail_samples / 20))
+        window = max(1, int(samples.shape[1] / 20))
         rms: list[float] = []
         for i in range(0, samples.shape[1], window):
             chunk = samples[:, i : i + window]
@@ -287,16 +318,11 @@ class AudioPipeline:
             return False
             
         slope = np.polyfit(np.arange(len(rms)), rms, 1)[0]
-        
-        # Thresholds: If slope is significant enough, we trust the analysis.
-        # Otherwise, for loud starts/ends, we might fail this check.
         threshold = 1e-5 
         
         if direction == "out":
-            # Looking for decreasing volume
             return slope < -threshold
         else:
-            # Looking for increasing volume
             return slope > threshold
 
     def _mix_crossfade(self, tail: np.ndarray, head: np.ndarray) -> np.ndarray:
@@ -375,10 +401,8 @@ class AudioPipeline:
         head = np.concatenate(chunks, axis=1)
         
         if head.shape[1] > needed:
-            # We got more than we needed (common with large frames)
             remainder_chunk = head[:, needed:]
             head = head[:, :needed]
-            # Create a new iterator that yields the leftover chunk first, then the rest of the stream
             return head, itertools.chain([remainder_chunk], frames)
             
         return head, frames
@@ -390,7 +414,6 @@ class AudioPipeline:
         if not current_track:
             return
 
-        # Initial Load
         current_total, current_frames = self._open_track(current_track)
         
         while current_track:
@@ -409,16 +432,13 @@ class AudioPipeline:
             # --- Main Processing Loop for Current Track ---
             for chunk in current_frames:
                 samples_sent += chunk.shape[1]
-                
-                # Buffer management
                 for ready in self._push_samples(chunk):
                     self._encode_samples(ready, gain_db=current_track.gain_db)
 
-                # Prefetch Logic
                 if (
                     duration_known
                     and next_track is None
-                    and (total_samples - samples_sent) <= (self._tail_samples * 1.5) # Lookahead slightly earlier
+                    and (total_samples - samples_sent) <= (self._tail_samples * 1.5)
                 ):
                     next_track = next_track_provider()
                     if next_track:
@@ -432,45 +452,54 @@ class AudioPipeline:
             if duration_known and next_track and next_head is not None and next_frames_iter is not None:
                 tail = self._tail if self._tail is not None else np.zeros((self._config.channels, 0), dtype=np.float32)
                 
-                # Check 1: Smart Detection
+                # 1. TRIM SILENCE: This is key. We remove trailing zeros.
+                # If the song had 4s of silence at the end, 'tail' is now 4s shorter.
+                tail = self._trim_silence(tail)
+                
+                # 2. DECIDE: Smart detect or just always crossfade?
+                # Even if detection fails, a small crossfade is usually better than a hard cut.
                 fade_out_smart = self._detect_fade(tail, direction="out")
                 fade_in_smart = self._detect_fade(next_head, direction="in")
                 
-                # Check 2: Fallback (Always crossfade if configured, unless strict analytics fail?)
-                # Simplified strategy: If we have enough audio, just do the crossfade. 
-                # Analytics only useful if you want to AVOID crossfading tracks that already fade out.
-                # For this implementation, we will perform the mix.
-                
-                logging.info(f"Performing Crossfade. Smart Detect: Out={fade_out_smart}, In={fade_in_smart}")
-                
-                # Apply Gains
-                curr_gain = math.pow(10.0, (self._config.gain_db + current_track.gain_db) / 20.0)
-                next_gain = math.pow(10.0, (self._config.gain_db + next_track.gain_db) / 20.0)
-                
-                mixed = self._mix_crossfade(tail * curr_gain, next_head * next_gain)
-                
-                # Switch metadata at the halfway point of the crossfade effectively
-                self._mp3_conn.set_title(next_track.title)
-                self._encode_samples_scaled(mixed)
-                
-                # Prepare state for next loop iteration
-                self._tail = None # Tail consumed by mix
-                current_track = next_track
-                current_total = next_total
-                current_frames = next_frames_iter # Vital: Use the iterator that continues AFTER the head
-                crossfade_occured = True
+                # If we have any audio left in tail after trimming, we crossfade.
+                if tail.shape[1] > 0:
+                    logging.info(f"Crossfading (Tail length: {tail.shape[1]/self._config.sample_rate:.2f}s)")
+                    
+                    curr_gain = math.pow(10.0, (self._config.gain_db + current_track.gain_db) / 20.0)
+                    next_gain = math.pow(10.0, (self._config.gain_db + next_track.gain_db) / 20.0)
+                    
+                    # Mix using the potentially shorter tail
+                    mixed = self._mix_crossfade(tail * curr_gain, next_head * next_gain)
+                    
+                    self._mp3_conn.set_title(next_track.title)
+                    self._encode_samples_scaled(mixed)
+                    
+                    self._tail = None
+                    current_track = next_track
+                    current_total = next_total
+                    current_frames = next_frames_iter
+                    crossfade_occured = True
             
             if crossfade_occured:
                 continue
 
-            # --- No Crossfade / Drain / Fallback ---
-            logging.info("No crossfade performed (or unknown duration). Draining tail.")
-            for ready in self._drain_tail():
-                self._encode_samples(ready, gain_db=current_track.gain_db)
+            # --- No Crossfade / Fallback ---
+            # Even here, we trim silence. If we are just playing songs back-to-back,
+            # we don't want to broadcast 4 seconds of silence.
+            logging.info("No crossfade. Draining tail (with silence trim).")
+            
+            # 1. Get the tail
+            tail = self._tail if self._tail is not None else np.zeros((self._config.channels, 0), dtype=np.float32)
+            
+            # 2. Trim silence from it
+            tail = self._trim_silence(tail)
+            
+            # 3. Play the trimmed tail
+            self._encode_samples(tail, gain_db=current_track.gain_db)
+            self._tail = None # Clear buffer
 
             if next_track and next_frames_iter:
-                # We have the next track ready, just didn't mix it.
-                # Play the head we already fetched.
+                # Play the pre-fetched head
                 self._mp3_conn.set_title(next_track.title)
                 for ready in self._push_samples(next_head): # type: ignore
                      self._encode_samples(ready, gain_db=next_track.gain_db)
@@ -479,12 +508,9 @@ class AudioPipeline:
                 current_total = next_total
                 current_frames = next_frames_iter
             else:
-                # Nothing queued, fetch fresh
                 current_track = next_track_provider()
                 if current_track:
                     current_total, current_frames = self._open_track(current_track)
-
-
 async def stream_forever(config: StreamConfig) -> None:
     pipeline = AudioPipeline(config)
     loop = asyncio.get_running_loop()
