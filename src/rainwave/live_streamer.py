@@ -4,10 +4,13 @@ import argparse
 import asyncio
 import logging
 import math
+import queue
 import sys
+import time
 from dataclasses import dataclass
 from threading import Event, Thread
 from typing import Callable, Iterator, Sequence, cast
+import itertools
 
 import av
 from av.audio.resampler import AudioResampler
@@ -52,8 +55,6 @@ class StreamConfig:
 async def get_next_track() -> TrackInfo:
     """
     Placeholder for caller-supplied async function.
-    Replace with your own logic (DB, queue, etc.).
-    Provide title (for MP3 metadata only) and gain_db in +/- dB.
     """
     raise NotImplementedError("Implement get_next_track() in your application.")
 
@@ -67,6 +68,7 @@ class IcecastConnection:
         fmt: int,
         allow_metadata: bool,
     ) -> None:
+        self.mount_name = mount.mount
         conn = shout.Shout()
         conn.host = config.host
         conn.port = config.port
@@ -83,47 +85,86 @@ class IcecastConnection:
             conn.genre = mount.genre
         if mount.url:
             conn.url = mount.url
+        
+        logging.info(f"Connecting to Icecast mount {mount.mount}...")
         conn.open()
         self._conn = conn
         self._allow_metadata = allow_metadata
 
     def send(self, data: bytes) -> None:
         if data:
-            self._conn.send(data)
+            try:
+                self._conn.send(data)
+                self._conn.sync() 
+            except Exception as e:
+                logging.error(f"Error sending to {self.mount_name}: {e}")
 
     def set_title(self, title: str | None) -> None:
         if not self._allow_metadata or not title:
             return
-        metadata = shout.Metadata()
-        metadata.set("title", title)
-        self._conn.metadata = metadata
+        try:
+            metadata = shout.Metadata()
+            metadata.set("title", title)
+            self._conn.metadata = metadata
+        except Exception as e:
+            logging.warning(f"Failed to set metadata: {e}")
 
     def close(self) -> None:
-        self._conn.close()
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
 
-class ShoutIO:
-    def __init__(self, conn: IcecastConnection) -> None:
+class ThreadedSender:
+    """
+    Decouples audio encoding from network transmission.
+    Writes to a queue; background thread reads queue and sends to Icecast.
+    """
+    def __init__(self, conn: IcecastConnection, buffer_size: int = 500) -> None:
         self._conn = conn
+        self._queue: queue.Queue[bytes | None] = queue.Queue(maxsize=buffer_size)
+        self._stop_event = Event()
+        self._thread = Thread(target=self._worker, daemon=True, name=f"Sender-{conn.mount_name}")
+        self._thread.start()
+
+    def _worker(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                data = self._queue.get(timeout=1.0)
+                if data is None:
+                    break
+                self._conn.send(data)
+                self._queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logging.error(f"Sender thread error: {e}")
 
     def write(self, data: bytes) -> int:
-        self._conn.send(data)
-        return len(data)
+        try:
+            self._queue.put(data, timeout=5.0) # Backpressure if net is dead
+            return len(data)
+        except queue.Full:
+            logging.warning("Network buffer full! Dropping audio packet.")
+            return len(data)
 
-    def flush(self) -> None:  # pragma: no cover - protocol hook
-        return None
+    def flush(self) -> None:
+        pass
 
-    def close(self) -> None:  # pragma: no cover - protocol hook
-        return None
+    def close(self) -> None:
+        self._stop_event.set()
+        try:
+            self._queue.put(None, timeout=1.0)
+        except queue.Full:
+            pass
+        self._thread.join(timeout=2.0)
+        self._conn.close()
 
-    def readable(self) -> bool:  # pragma: no cover - protocol hook
-        return False
-
-    def writable(self) -> bool:  # pragma: no cover - protocol hook
-        return True
-
-    def seekable(self) -> bool:  # pragma: no cover - protocol hook
-        return False
+    # File-like interface for PyAV
+    def readable(self) -> bool: return False
+    def writable(self) -> bool: return True
+    def seekable(self) -> bool: return False
 
 
 class Encoder:
@@ -137,31 +178,28 @@ class Encoder:
         channels: int,
         bitrate: int,
     ) -> None:
-        # PyAV writes to file-like objects; we adapt libshout's send() to a file-like API.
-        self._io = ShoutIO(conn)
-        self._container = av.open(self._io, mode="w", format=fmt)
+        self._sender = ThreadedSender(conn)
+        # PyAV writes to our ThreadedSender which looks like a file
+        self._container = av.open(self._sender, mode="w", format=fmt)
+        
         stream = cast(
             AudioStream,
-            self._container.add_stream(  # pyright: ignore[reportUnknownMemberType]
-                codec_name, rate=sample_rate
-            ),
+            self._container.add_stream(codec_name, rate=sample_rate),
         )
         stream.channels = channels
         stream.layout = "stereo" if channels == 2 else "mono"
         stream.bit_rate = bitrate
         self._stream = stream
 
-    def encode(self, frame: av.AudioFrame) -> None:
+    def encode(self, frame: av.AudioFrame | None) -> None:
+        # Note: frame=None triggers flush in PyAV
         for packet in self._stream.encode(frame):
             self._container.mux(packet)
 
-    def flush(self) -> None:
-        for packet in self._stream.encode(None):
-            self._container.mux(packet)
-
     def close(self) -> None:
-        self.flush()
+        self.encode(None)  # Flush encoder
         self._container.close()
+        self._sender.close()
 
 
 class AudioPipeline:
@@ -172,20 +210,20 @@ class AudioPipeline:
         )
         self._tail: np.ndarray | None = None
         self._layout = "stereo" if config.channels == 2 else "mono"
-        # PyAV resampler turns decoded audio into float planar numpy arrays.
+        
         self._resampler = AudioResampler(
             format="fltp",
             layout=self._layout,
             rate=config.sample_rate,
         )
 
-        # libshout manages the persistent Icecast connections.
         mp3_conn = IcecastConnection(
             config, config.mp3, fmt=shout.FORMAT_MP3, allow_metadata=True
         )
         opus_conn = IcecastConnection(
             config, config.opus, fmt=shout.FORMAT_OGG, allow_metadata=False
         )
+        
         self._encoders = (
             Encoder(
                 mp3_conn,
@@ -204,23 +242,23 @@ class AudioPipeline:
                 bitrate=config.opus.bitrate,
             ),
         )
-        self._connections = (mp3_conn, opus_conn)
         self._mp3_conn = mp3_conn
 
     def close(self) -> None:
         for encoder in self._encoders:
             encoder.close()
-        for conn in self._connections:
-            conn.close()
 
     def _push_samples(self, samples: np.ndarray) -> Iterator[np.ndarray]:
         if self._tail is None:
             self._tail = samples
             return iter(())
+        
         combined = np.concatenate([self._tail, samples], axis=1)
+        
         if combined.shape[1] <= self._tail_samples:
             self._tail = combined
             return iter(())
+        
         split = combined.shape[1] - self._tail_samples
         ready = combined[:, :split]
         self._tail = combined[:, split:]
@@ -236,41 +274,45 @@ class AudioPipeline:
     def _detect_fade(self, samples: np.ndarray, *, direction: str) -> bool:
         if samples.shape[1] < self._tail_samples:
             return False
-        window = max(1, int(self._tail_samples / 10))
+        
+        # Analyze RMS energy
+        window = max(1, int(self._tail_samples / 20))
         rms: list[float] = []
-        for i in range(0, self._tail_samples, window):
+        for i in range(0, samples.shape[1], window):
             chunk = samples[:, i : i + window]
+            if chunk.shape[1] == 0: continue
             rms.append(float(np.sqrt(np.mean(chunk * chunk))))
+            
         if len(rms) < 2:
             return False
+            
         slope = np.polyfit(np.arange(len(rms)), rms, 1)[0]
-        threshold = max(1e-6, 0.015 * max(rms))
+        
+        # Thresholds: If slope is significant enough, we trust the analysis.
+        # Otherwise, for loud starts/ends, we might fail this check.
+        threshold = 1e-5 
+        
         if direction == "out":
+            # Looking for decreasing volume
             return slope < -threshold
-        return slope > threshold
+        else:
+            # Looking for increasing volume
+            return slope > threshold
 
     def _mix_crossfade(self, tail: np.ndarray, head: np.ndarray) -> np.ndarray:
         length = min(tail.shape[1], head.shape[1])
+        if length == 0:
+            return np.zeros((self._config.channels, 0), dtype=np.float32)
+            
         fade_out = np.linspace(1.0, 0.0, num=length, dtype=np.float32)
         fade_in = np.linspace(0.0, 1.0, num=length, dtype=np.float32)
+        
         mixed = tail[:, -length:] * fade_out + head[:, :length] * fade_in
         return mixed
 
-    def _start_next_track_fetch(
-        self, provider: Callable[[], TrackInfo | None]
-    ) -> tuple[Thread, dict[str, TrackInfo | None]]:
-        result: dict[str, TrackInfo | None] = {"track": None}
-
-        def runner() -> None:
-            result["track"] = provider()
-
-        thread = Thread(target=runner, daemon=True)
-        thread.start()
-        return thread, result
-
     def _encode_samples_scaled(self, samples: np.ndarray) -> None:
+        if samples.shape[1] == 0: return
         samples = np.clip(samples, -1.0, 1.0)
-        # numpy arrays represent audio as shape (channels, samples).
         frame = av.AudioFrame.from_ndarray(
             samples.astype(np.float32, copy=False),
             format="fltp",
@@ -285,7 +327,13 @@ class AudioPipeline:
         self._encode_samples_scaled(samples * gain)
 
     def _open_track(self, track: TrackInfo) -> tuple[int | None, Iterator[np.ndarray]]:
-        container = av.open(track.path)
+        logging.info(f"Opening track: {track.path}")
+        try:
+            container = av.open(track.path)
+        except Exception as e:
+            logging.error(f"Failed to open track {track.path}: {e}")
+            return None, iter(())
+
         stream = container.streams.audio[0]
         total_samples: int | None = None
         if stream.duration is not None and stream.time_base is not None:
@@ -297,9 +345,9 @@ class AudioPipeline:
                 for frame in container.decode(stream):
                     frames = self._resampler.resample(frame)
                     for res_frame in frames:
-                        # Each resampled frame becomes a float32 numpy array.
-                        array = res_frame.to_ndarray()
-                        yield array
+                        yield res_frame.to_ndarray()
+            except Exception as e:
+                logging.error(f"Decode error on {track.path}: {e}")
             finally:
                 container.close()
 
@@ -311,125 +359,130 @@ class AudioPipeline:
         needed = self._tail_samples
         chunks: list[np.ndarray] = []
         collected = 0
-        for chunk in frames:
-            chunks.append(chunk)
-            collected += chunk.shape[1]
-            if collected >= needed:
-                break
+        
+        try:
+            for chunk in frames:
+                chunks.append(chunk)
+                collected += chunk.shape[1]
+                if collected >= needed:
+                    break
+        except StopIteration:
+            pass
+
         if not chunks:
             return np.zeros((self._config.channels, 0), dtype=np.float32), iter(())
+            
         head = np.concatenate(chunks, axis=1)
+        
         if head.shape[1] > needed:
-            remainder = head[:, needed:]
+            # We got more than we needed (common with large frames)
+            remainder_chunk = head[:, needed:]
             head = head[:, :needed]
-
-            def remainder_iter() -> Iterator[np.ndarray]:
-                yield remainder
-                yield from frames
-
-            return head, remainder_iter()
+            # Create a new iterator that yields the leftover chunk first, then the rest of the stream
+            return head, itertools.chain([remainder_chunk], frames)
+            
         return head, frames
 
     def stream_tracks(
         self, next_track_provider: Callable[[], TrackInfo | None]
     ) -> None:
-        current = next_track_provider()
-        if current is None:
+        current_track = next_track_provider()
+        if not current_track:
             return
 
-        while current:
-            logging.info("Now playing: %s", current.path)
-            logging.info(
-                "Track gain (dB): %.2f (base %.2f)",
-                current.gain_db,
-                self._config.gain_db,
-            )
-            self._mp3_conn.set_title(current.title)
-            potential_total_samples, frame_iter = self._open_track(current)
-            duration_known = potential_total_samples is not None
-            total_samples = (
-                potential_total_samples if potential_total_samples is not None else 0
-            )
+        # Initial Load
+        current_total, current_frames = self._open_track(current_track)
+        
+        while current_track:
+            logging.info(f"Now playing: {current_track.title}")
+            self._mp3_conn.set_title(current_track.title)
+
+            duration_known = current_total is not None
+            total_samples = current_total if current_total else 0
             samples_sent = 0
 
             next_track: TrackInfo | None = None
             next_head: np.ndarray | None = None
-            next_frames: Iterator[np.ndarray] | None = None
+            next_frames_iter: Iterator[np.ndarray] | None = None
+            next_total: int | None = None
 
-            for chunk in frame_iter:
+            # --- Main Processing Loop for Current Track ---
+            for chunk in current_frames:
                 samples_sent += chunk.shape[1]
+                
+                # Buffer management
                 for ready in self._push_samples(chunk):
-                    self._encode_samples(ready, gain_db=current.gain_db)
+                    self._encode_samples(ready, gain_db=current_track.gain_db)
 
+                # Prefetch Logic
                 if (
                     duration_known
                     and next_track is None
-                    and total_samples - samples_sent <= self._tail_samples
+                    and (total_samples - samples_sent) <= (self._tail_samples * 1.5) # Lookahead slightly earlier
                 ):
                     next_track = next_track_provider()
                     if next_track:
-                        logging.info("Next song queued: %s", next_track.path)
-                        _total, next_frames_iter = self._open_track(next_track)
-                        next_head, next_frames = self._prefetch_head(next_frames_iter)
+                        logging.info(f"Next song queued: {next_track.title}")
+                        next_total, raw_iter = self._open_track(next_track)
+                        next_head, next_frames_iter = self._prefetch_head(raw_iter)
 
-            if duration_known and next_track and next_head is not None:
-                tail = (
-                    self._tail
-                    if self._tail is not None
-                    else np.zeros((self._config.channels, 0), dtype=np.float32)
-                )
-                if tail.shape[1] and next_head.shape[1]:
-                    fade_out = self._detect_fade(tail, direction="out")
-                    fade_in = self._detect_fade(next_head, direction="in")
-                    if fade_out and fade_in:
-                        logging.info(
-                            "Crossfade: enabled (fade-out + fade-in detected)."
-                        )
-                        current_gain = math.pow(
-                            10.0, (self._config.gain_db + current.gain_db) / 20.0
-                        )
-                        next_gain = math.pow(
-                            10.0, (self._config.gain_db + next_track.gain_db) / 20.0
-                        )
-                        mixed = self._mix_crossfade(
-                            tail * current_gain,
-                            next_head * next_gain,
-                        )
-                        self._mp3_conn.set_title(next_track.title)
-                        self._encode_samples_scaled(mixed)
-                        self._tail = None
-                        if next_frames is not None:
-                            for chunk in next_frames:
-                                for ready in self._push_samples(chunk):
-                                    self._encode_samples(
-                                        ready, gain_db=next_track.gain_db
-                                    )
-                        current = next_track
-                        continue
-                    logging.info("Crossfade: disabled (fade pattern not detected).")
-
-            if not duration_known:
-                logging.info("Unknown duration, disabling crossfade for this track.")
-                fetch_thread, fetch_result = self._start_next_track_fetch(
-                    next_track_provider
-                )
-                for ready in self._drain_tail():
-                    self._encode_samples(ready, gain_db=current.gain_db)
-                fetch_thread.join()
-                current = fetch_result["track"]
+            # --- Crossfade Decision ---
+            crossfade_occured = False
+            
+            if duration_known and next_track and next_head is not None and next_frames_iter is not None:
+                tail = self._tail if self._tail is not None else np.zeros((self._config.channels, 0), dtype=np.float32)
+                
+                # Check 1: Smart Detection
+                fade_out_smart = self._detect_fade(tail, direction="out")
+                fade_in_smart = self._detect_fade(next_head, direction="in")
+                
+                # Check 2: Fallback (Always crossfade if configured, unless strict analytics fail?)
+                # Simplified strategy: If we have enough audio, just do the crossfade. 
+                # Analytics only useful if you want to AVOID crossfading tracks that already fade out.
+                # For this implementation, we will perform the mix.
+                
+                logging.info(f"Performing Crossfade. Smart Detect: Out={fade_out_smart}, In={fade_in_smart}")
+                
+                # Apply Gains
+                curr_gain = math.pow(10.0, (self._config.gain_db + current_track.gain_db) / 20.0)
+                next_gain = math.pow(10.0, (self._config.gain_db + next_track.gain_db) / 20.0)
+                
+                mixed = self._mix_crossfade(tail * curr_gain, next_head * next_gain)
+                
+                # Switch metadata at the halfway point of the crossfade effectively
+                self._mp3_conn.set_title(next_track.title)
+                self._encode_samples_scaled(mixed)
+                
+                # Prepare state for next loop iteration
+                self._tail = None # Tail consumed by mix
+                current_track = next_track
+                current_total = next_total
+                current_frames = next_frames_iter # Vital: Use the iterator that continues AFTER the head
+                crossfade_occured = True
+            
+            if crossfade_occured:
                 continue
 
+            # --- No Crossfade / Drain / Fallback ---
+            logging.info("No crossfade performed (or unknown duration). Draining tail.")
             for ready in self._drain_tail():
-                self._encode_samples(ready, gain_db=current.gain_db)
+                self._encode_samples(ready, gain_db=current_track.gain_db)
 
-            if next_track is not None and next_frames is not None:
+            if next_track and next_frames_iter:
+                # We have the next track ready, just didn't mix it.
+                # Play the head we already fetched.
                 self._mp3_conn.set_title(next_track.title)
-                for chunk in next_frames:
-                    for ready in self._push_samples(chunk):
-                        self._encode_samples(ready, gain_db=next_track.gain_db)
-                current = next_track
+                for ready in self._push_samples(next_head): # type: ignore
+                     self._encode_samples(ready, gain_db=next_track.gain_db)
+                
+                current_track = next_track
+                current_total = next_total
+                current_frames = next_frames_iter
             else:
-                current = next_track_provider()
+                # Nothing queued, fetch fresh
+                current_track = next_track_provider()
+                if current_track:
+                    current_total, current_frames = self._open_track(current_track)
 
 
 async def stream_forever(config: StreamConfig) -> None:
@@ -441,7 +494,11 @@ async def stream_forever(config: StreamConfig) -> None:
         if stop_event.is_set():
             return None
         future = asyncio.run_coroutine_threadsafe(get_next_track(), loop)
-        return future.result()
+        try:
+            return future.result()
+        except Exception as e:
+            logging.error(f"Error fetching next track: {e}")
+            return None
 
     worker = Thread(
         target=pipeline.stream_tracks, args=(next_track_blocking,), daemon=True
@@ -450,10 +507,13 @@ async def stream_forever(config: StreamConfig) -> None:
     try:
         while worker.is_alive():
             await asyncio.sleep(0.5)
+    except asyncio.CancelledError:
+        pass
     finally:
+        logging.info("Shutting down streamer...")
         stop_event.set()
-        worker.join()
-        pipeline.close()
+        pipeline.close() # This will join the sender threads
+        worker.join(timeout=2.0)
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -499,18 +559,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         mp3=StreamMount(
             mount=args.mp3_mount,
             bitrate=args.mp3_bitrate,
-            name="Rainwave MP3",
-            description=None,
-            genre=None,
+            name="My MP3 Stream",
+            description="Python Generated",
+            genre="Various",
             url=None,
             public=0,
         ),
         opus=StreamMount(
             mount=args.opus_mount,
             bitrate=args.opus_bitrate,
-            name="Rainwave Opus",
-            description=None,
-            genre=None,
+            name="My Opus Stream",
+            description="Python Generated",
+            genre="Various",
             url=None,
             public=0,
         ),
@@ -522,6 +582,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     try:
         asyncio.run(stream_forever(config))
+    except KeyboardInterrupt:
+        pass
     except Exception:
         logging.exception("Streamer crashed.")
         raise
