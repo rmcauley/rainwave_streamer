@@ -6,12 +6,7 @@ from av.audio.stream import AudioStream
 
 from streamer.icecast_connection import IcecastConnection
 from streamer.threaded_sender import ThreadedSender
-
-mp3_bitrate_approx = 128
-opus_bitrate_approx = 128
-sample_rate = 48000
-channels = 2
-layout = "stereo"
+from streamer.stream_constants import sample_rate, layout
 
 
 class Encoder:

@@ -3,6 +3,12 @@ from typing import Literal
 
 import shout
 
+from streamer.stream_constants import (
+    sample_rate,
+    channels,
+    opus_bitrate_approx,
+    mp3_bitrate_approx,
+)
 from streamer.stream_config import StreamConfig
 from streamer.stream_mount import StreamMount
 
@@ -27,17 +33,16 @@ class IcecastConnection:
         conn.protocol = "http"
         conn.public = mount.public
         conn.name = mount.name
-        # conn.audio_info = {
-        #     shout.SHOUT_AI_BITRATE: str(opus_bitrate_approx) if fmt == '',
-        #     shout.SHOUT_AI_SAMPLERATE: str(sample_rate),
-        #     shout.SHOUT_AI_CHANNELS: str(channels),
-        # }
-        # if mount.description:
-        #     conn.description = mount.description
-        if mount.genre:
-            conn.genre = mount.genre
-        if mount.url:
-            conn.url = mount.url
+        conn.description = mount.description
+        conn.genre = mount.genre
+        conn.url = mount.url
+        conn.audio_info = {
+            shout.SHOUT_AI_BITRATE: (
+                str(opus_bitrate_approx) if fmt == "ogg" else str(mp3_bitrate_approx)
+            ),
+            shout.SHOUT_AI_SAMPLERATE: str(sample_rate),
+            shout.SHOUT_AI_CHANNELS: str(channels),
+        }
 
         logging.info(f"Connecting to Icecast mount {mount.mount}...")
         conn.open()

@@ -8,7 +8,8 @@ import av
 from av.audio.resampler import AudioResampler
 import numpy as np
 
-from streamer.encoder import Encoder, sample_rate, channels, layout
+from streamer.stream_constants import sample_rate, channels, layout
+from streamer.encoder import Encoder
 from streamer.icecast_connection import IcecastConnection
 from streamer.stream_config import StreamConfig
 from streamer.track_info import TrackInfo
@@ -184,7 +185,6 @@ class AudioPipeline:
         sleep_time = target_elapsed - elapsed - self._ahead_buffer_seconds
         if sleep_time > 0:
             time.sleep(sleep_time)
-        print(elapsed)
 
     def _open_track(self, track: TrackInfo) -> tuple[int | None, Iterator[np.ndarray]]:
         logging.info(f"Opening track: {track.path}")
@@ -268,7 +268,6 @@ class AudioPipeline:
                 samples_sent += chunk.shape[1]
                 for ready in self._push_samples(chunk):
                     self._encode_samples(ready, gain_db=current_track.gain_db)
-                logging.debug(f"Sent {samples_sent}")
 
                 if (
                     duration_known

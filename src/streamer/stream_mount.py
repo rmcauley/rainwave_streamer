@@ -6,6 +6,7 @@ class StreamMount:
     mount: str
     bitrate: int
     name: str
-    genre: str | None
-    url: str | None
+    description: str
+    genre: str
+    url: str
     public: int

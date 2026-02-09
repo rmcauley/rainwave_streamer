@@ -6,7 +6,7 @@ from typing import Sequence
 
 from streamer.stream_config import StreamConfig
 from streamer.stream_mount import StreamMount
-from streamer.encoder import mp3_bitrate_approx, opus_bitrate_approx
+from streamer.stream_constants import mp3_bitrate_approx, opus_bitrate_approx
 from stream_forever import stream_forever
 
 import config
@@ -46,6 +46,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             mount=f"{station_config['stream_filename']}.mp3",
             bitrate=mp3_bitrate_approx,
             name=station_config["name"],
+            description=station_config["description"],
             genre="Game",
             url=f"http://rainwave.cc/{station_config['stream_filename']}",
             public=1,
@@ -54,6 +55,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             mount=f"{station_config['stream_filename']}.ogg",
             bitrate=opus_bitrate_approx,
             name=station_config["name"],
+            description=station_config["description"],
             genre="Game",
             url=f"http://rainwave.cc/{station_config['stream_filename']}",
             public=1,
