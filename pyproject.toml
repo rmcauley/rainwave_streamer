@@ -1,17 +1,15 @@
 [project]
 name = "rainwave-streamer"
-version = "5.0.0"
+version = "0.0.1"
 description = "rainwave.cc"
 readme = "README.md"
 requires-python = "~=3.14.0"
 dependencies = [
-    "av==13.0.0",
-    "numpy==2.0.0",
+    "av==16.1.0",
+    "numpy==2.4.2",
+    "orjson==3.11.7",
     "python-shout==0.2.8",
 ]
-
-[project.scripts]
-rainwave-icecast-live = "rainwave.live_streamer:main"
 
 [build-system]
 requires = ["setuptools>=69", "wheel"]
@@ -27,9 +25,8 @@ where = ["src"]
 dev = [
     "black==26.1.0",
     "mypy==1.19.1",
-    "pytest==9.0.2",
 ]
 
 [tool.mypy]
 files = "src/**/*.py"
-mypy_path = ["src/typestubs"]
+mypy_path = ["src", "src/typestubs"]

@@ -53,4 +53,5 @@ rainwave/bin
 rainwave/lib
 rainwave/pyvenv.cfg
 
-src/rainwave.egg-info
+src/rainwave_streamer.egg-info
+src/config.py

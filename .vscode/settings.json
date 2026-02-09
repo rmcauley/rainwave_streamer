@@ -8,7 +8,7 @@
     ".mypy_cache": true,
     "node_modules": true,
     ".pytest_cache": true,
-    "src/rainwave.egg-info": true
+    "src/rainwave_streamer.egg-info": true
   },
   "editor.formatOnSave": true,
   "files.insertFinalNewline": true,
