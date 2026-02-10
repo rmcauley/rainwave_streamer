@@ -18,7 +18,6 @@ from streamer.track_info import TrackInfo
 
 crossfade_seconds = 5
 buffer_seconds = 2
-gain_db = 0
 ahead_buffer_ms_default = 200
 
 
@@ -186,7 +185,7 @@ class AudioPipeline:
             encoder.encode(frame)
 
     def _encode_samples(self, samples: np.ndarray, *, gain_db: float) -> None:
-        gain = math.pow(10.0, (gain_db + gain_db) / 20.0)
+        gain = math.pow(10.0, gain_db / 20.0)
         self._encode_samples_scaled(samples * gain)
 
     def _realtime_wait(self, samples_count: int) -> None:
@@ -301,8 +300,8 @@ class AudioPipeline:
                 f"Crossfading (Buffer length: {buffered.shape[1]/sample_rate:.2f}s)"
             )
 
-            curr_gain = math.pow(10.0, (gain_db + current_track.gain_db) / 20.0)
-            next_gain = math.pow(10.0, (gain_db + queued.track.gain_db) / 20.0)
+            curr_gain = math.pow(10.0, current_track.gain_db / 20.0)
+            next_gain = math.pow(10.0, queued.track.gain_db / 20.0)
 
             mixed = self._mix_crossfade(buffered * curr_gain, head * next_gain)
 
