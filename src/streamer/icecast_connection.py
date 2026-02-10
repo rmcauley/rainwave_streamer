@@ -20,7 +20,6 @@ class IcecastConnection:
         mount: StreamMount,
         *,
         fmt: Literal["mp3", "ogg"],
-        allow_metadata: bool,
     ) -> None:
         self.mount_name = mount.mount
         conn = shout.Shout()
@@ -47,7 +46,6 @@ class IcecastConnection:
         logging.info(f"Connecting to Icecast mount {mount.mount}...")
         conn.open()
         self._conn = conn
-        self._allow_metadata = allow_metadata
 
     def send(self, data: bytes) -> None:
         if data:
@@ -55,17 +53,6 @@ class IcecastConnection:
                 self._conn.send(data)
             except Exception as e:
                 logging.error(f"Error sending to {self.mount_name}: {e}")
-
-    def set_title(self, title: str | None) -> None:
-        pass
-        # if not self._allow_metadata or not title:
-        #     return
-        # try:
-        #     metadata = shout.Metadata()
-        #     metadata.set("title", title)
-        #     self._conn.metadata = metadata
-        # except Exception as e:
-        #     logging.warning(f"Failed to set metadata: {e}")
 
     def close(self) -> None:
         try:

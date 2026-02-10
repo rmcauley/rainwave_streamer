@@ -7,42 +7,29 @@ from dataclasses import dataclass
 from collections import deque
 
 import av
-from av.audio.resampler import AudioResampler
 import numpy as np
 
+from streamer.audio_track import AudioTrack, AudioTrackInfo
 from streamer.stream_constants import sample_rate, channels, layout
 from streamer.encoder import Encoder
 from streamer.icecast_connection import IcecastConnection
 from streamer.stream_config import StreamConfig
-from streamer.track_info import TrackInfo
 
 crossfade_seconds = 5
 buffer_seconds = 2
-ahead_buffer_ms_default = 200
+ahead_buffer_ms = 200
 
 
 class AudioPipeline:
-    def __init__(
-        self, config: StreamConfig, *, ahead_buffer_ms: int = ahead_buffer_ms_default
-    ) -> None:
+    def __init__(self, config: StreamConfig) -> None:
         self._config = config
-        self._buffer_samples = int(sample_rate * max(crossfade_seconds, buffer_seconds))
         self._queue: deque[np.ndarray] = deque()
-        self._queue_samples: int = 0
+        self._queue_samples = 0
         self._realtime_start: float | None = None
         self._realtime_samples_sent = 0
-        self._ahead_buffer_seconds = max(0.0, ahead_buffer_ms / 1000.0)
 
-        self._resampler = AudioResampler(
-            format="fltp",
-            layout=layout,
-            rate=sample_rate,
-        )
-
-        mp3_conn = IcecastConnection(config, config.mp3, fmt="mp3", allow_metadata=True)
-        opus_conn = IcecastConnection(
-            config, config.opus, fmt="ogg", allow_metadata=False
-        )
+        mp3_conn = IcecastConnection(config, config.mp3, fmt="mp3")
+        opus_conn = IcecastConnection(config, config.opus, fmt="ogg")
 
         self._encoders = (
             Encoder(
@@ -56,7 +43,6 @@ class AudioPipeline:
                 fmt="ogg",
             ),
         )
-        self._mp3_conn = mp3_conn
 
     def close(self) -> None:
         for encoder in self._encoders:
@@ -135,6 +121,99 @@ class AudioPipeline:
 
         return samples
 
+    def _trim_leading_silence_from_iter(
+        self,
+        head: np.ndarray,
+        frames: Iterator[np.ndarray],
+        *,
+        threshold_db: float = -60.0,
+    ) -> tuple[np.ndarray, Iterator[np.ndarray], int]:
+        """
+        Removes leading silence from a head chunk, consuming frames as needed.
+        Returns (trimmed_head, remaining_frames, samples_trimmed).
+        """
+        threshold_linear = math.pow(10, threshold_db / 20)
+        trimmed_samples = 0
+        buffer = head
+
+        while True:
+            if buffer.shape[1] == 0:
+                try:
+                    buffer = next(frames)
+                except StopIteration:
+                    return (
+                        np.zeros((channels, 0), dtype=np.float32),
+                        iter(()),
+                        trimmed_samples,
+                    )
+
+            amplitudes = np.max(np.abs(buffer), axis=0)
+            audible_indices = np.where(amplitudes > threshold_linear)[0]
+            if len(audible_indices) > 0:
+                first_audible = int(audible_indices[0])
+                if first_audible:
+                    trimmed_samples += first_audible
+                    buffer = buffer[:, first_audible:]
+                return buffer, frames, trimmed_samples
+
+            trimmed_samples += buffer.shape[1]
+            try:
+                buffer = next(frames)
+            except StopIteration:
+                return (
+                    np.zeros((channels, 0), dtype=np.float32),
+                    iter(()),
+                    trimmed_samples,
+                )
+
+    def _trim_leading_silence_iter(
+        self, frames: Iterator[np.ndarray]
+    ) -> tuple[Iterator[np.ndarray], int]:
+        try:
+            head = next(frames)
+        except StopIteration:
+            return iter(()), 0
+
+        trimmed_head, frames, trimmed = self._trim_leading_silence_from_iter(
+            head, frames
+        )
+        if trimmed_head.shape[1] == 0:
+            return frames, trimmed
+        return itertools.chain([trimmed_head], frames), trimmed
+
+    def _top_up_head(
+        self, head: np.ndarray, frames: Iterator[np.ndarray], *, needed: int
+    ) -> tuple[np.ndarray, Iterator[np.ndarray]]:
+        if head.shape[1] >= needed:
+            return head, frames
+
+        chunks: list[np.ndarray] = []
+        collected = 0
+        if head.shape[1] > 0:
+            chunks.append(head)
+            collected = head.shape[1]
+
+        try:
+            for chunk in frames:
+                if chunk.shape[1] == 0:
+                    continue
+                chunks.append(chunk)
+                collected += chunk.shape[1]
+                if collected >= needed:
+                    break
+        except StopIteration:
+            pass
+
+        if not chunks:
+            return np.zeros((channels, 0), dtype=np.float32), iter(())
+
+        combined = np.concatenate(chunks, axis=1)
+        if combined.shape[1] > needed:
+            remainder_chunk = combined[:, needed:]
+            combined = combined[:, :needed]
+            return combined, itertools.chain([remainder_chunk], frames)
+        return combined, frames
+
     def _detect_fade(self, samples: np.ndarray, *, direction: str) -> bool:
         if samples.shape[1] < (sample_rate * 0.5):  # Need at least 0.5s to judge fade
             return False
@@ -185,8 +264,9 @@ class AudioPipeline:
             encoder.encode(frame)
 
     def _encode_samples(self, samples: np.ndarray, *, gain_db: float) -> None:
-        gain = math.pow(10.0, gain_db / 20.0)
-        self._encode_samples_scaled(samples * gain)
+        self._encode_samples_scaled(
+            self._audio_source.apply_gain(samples, track_gain_db=gain_db)
+        )
 
     def _realtime_wait(self, samples_count: int) -> None:
         if samples_count <= 0:
@@ -200,33 +280,6 @@ class AudioPipeline:
         sleep_time = target_elapsed - elapsed - self._ahead_buffer_seconds
         if sleep_time > 0:
             time.sleep(sleep_time)
-
-    def _open_track(self, track: TrackInfo) -> tuple[int | None, Iterator[np.ndarray]]:
-        logging.info(f"Opening track: {track.path}")
-        try:
-            container = av.open(track.path)
-        except Exception as e:
-            logging.error(f"Failed to open track {track.path}: {e}")
-            return None, iter(())
-
-        stream = container.streams.audio[0]
-        total_samples: int | None = None
-        if stream.duration is not None and stream.time_base is not None:
-            duration_seconds = float(stream.duration * stream.time_base)
-            total_samples = int(duration_seconds * sample_rate)
-
-        def iterator() -> Iterator[np.ndarray]:
-            try:
-                for frame in container.decode(stream):
-                    frames = self._resampler.resample(frame)
-                    for res_frame in frames:
-                        yield res_frame.to_ndarray()
-            except Exception as e:
-                logging.error(f"Decode error on {track.path}: {e}")
-            finally:
-                container.close()
-
-        return total_samples, iterator()
 
     def _prefetch_head(
         self, frames: Iterator[np.ndarray]
@@ -270,8 +323,22 @@ class AudioPipeline:
         if not next_track:
             return None
         logging.info(f"Next song queued: {next_track.title}")
-        next_total, raw_iter = self._open_track(next_track)
+        next_total, raw_iter = self._audio_source.open(next_track)
         next_head, next_frames_iter = self._prefetch_head(raw_iter)
+        next_head, next_frames_iter, trimmed = self._trim_leading_silence_from_iter(
+            next_head, next_frames_iter
+        )
+        if trimmed:
+            logging.debug(
+                "Trimmed %d leading silent samples (%.2fs) from queued track.",
+                trimmed,
+                trimmed / sample_rate,
+            )
+        if next_total is not None:
+            next_total = max(0, next_total - trimmed)
+        next_head, next_frames_iter = self._top_up_head(
+            next_head, next_frames_iter, needed=self._buffer_samples
+        )
         return self._QueuedTrack(
             track=next_track,
             total_samples=next_total,
@@ -300,8 +367,8 @@ class AudioPipeline:
                 f"Crossfading (Buffer length: {buffered.shape[1]/sample_rate:.2f}s)"
             )
 
-            curr_gain = math.pow(10.0, current_track.gain_db / 20.0)
-            next_gain = math.pow(10.0, queued.track.gain_db / 20.0)
+            curr_gain = self._audio_source.gain_factor(current_track.gain_db)
+            next_gain = self._audio_source.gain_factor(queued.track.gain_db)
 
             mixed = self._mix_crossfade(buffered * curr_gain, head * next_gain)
 
@@ -339,7 +406,16 @@ class AudioPipeline:
         if not current_track:
             return
 
-        current_total, current_frames = self._open_track(current_track)
+        current_total, current_frames = self._audio_source.open(current_track)
+        current_frames, trimmed = self._trim_leading_silence_iter(current_frames)
+        if trimmed:
+            logging.debug(
+                "Trimmed %d leading silent samples (%.2fs) from current track.",
+                trimmed,
+                trimmed / sample_rate,
+            )
+        if current_total is not None:
+            current_total = max(0, current_total - trimmed)
 
         while current_track:
             logging.info(f"Now playing: {current_track.title}")
@@ -382,4 +458,10 @@ class AudioPipeline:
             else:
                 current_track = next_track_provider()
                 if current_track:
-                    current_total, current_frames = self._open_track(current_track)
+                    current_total, current_frames = self._audio_source.open(
+                        current_track
+                    )
+
+    #########################################################################
+    # Beware: below is AI slop territory
+    #########################################################################
