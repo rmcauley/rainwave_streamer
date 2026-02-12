@@ -6,7 +6,7 @@ import logging
 import queue
 from threading import Condition, Event, Thread
 
-from streamer.icecast_connection import IcecastConnection
+from streamer.icecast_connection import IcecastConnection, IcecastConnectionError
 
 
 class ThreadedSender:
@@ -58,7 +58,7 @@ class ThreadedSender:
             try:
                 self._conn.send(data)
                 return
-            except Exception as send_error:
+            except IcecastConnectionError as send_error:
                 logging.warning(
                     "Send failed to %s, retrying: %s",
                     self._conn.mount_name,
@@ -71,7 +71,7 @@ class ThreadedSender:
                     logging.info(
                         "Reconnected to Icecast mount %s.", self._conn.mount_name
                     )
-                except Exception as reconnect_error:
+                except IcecastConnectionError as reconnect_error:
                     logging.warning(
                         "Reconnect failed for %s, will retry: %s",
                         self._conn.mount_name,
@@ -86,10 +86,14 @@ class ThreadedSender:
 
         data_len = len(data)
         with self._buffer_cond:
-            while (
-                not self._stop_event.is_set()
-                and self._buffered_bytes + data_len > self._max_buffer_bytes
-            ):
+            while not self._stop_event.is_set():
+                would_overflow = self._buffered_bytes + data_len > self._max_buffer_bytes
+                # Allow one oversized packet through only when buffer is empty.
+                oversize_allowed = (
+                    data_len > self._max_buffer_bytes and self._buffered_bytes == 0
+                )
+                if not would_overflow or oversize_allowed:
+                    break
                 self._buffer_cond.wait(timeout=0.25)
 
             if self._stop_event.is_set():

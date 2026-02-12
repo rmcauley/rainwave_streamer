@@ -18,6 +18,10 @@ from streamer.stream_config import StreamConfig
 from streamer.stream_mount import StreamMount
 
 
+class IcecastConnectionError(Exception):
+    pass
+
+
 class IcecastConnection:
     def __init__(
         self,
@@ -60,7 +64,12 @@ class IcecastConnection:
         }
 
         logging.info(f"Connecting to Icecast mount {mount.mount}...")
-        conn.open()
+        try:
+            conn.open()
+        except Exception as e:
+            raise IcecastConnectionError(
+                f"Failed opening Icecast connection for {mount.mount}: {e}"
+            ) from e
         return conn
 
     def send(self, data: bytes) -> None:
@@ -74,7 +83,12 @@ class IcecastConnection:
         # During reconnect, this snapshot can be closed concurrently and produce one
         # transient send failure. ThreadedSender retry/reconnect logic handles this,
         # and occasional loss in that failure window is acceptable for this daemon.
-        conn.send(data)
+        try:
+            conn.send(data)
+        except Exception as e:
+            raise IcecastConnectionError(
+                f"Failed sending packet to {self.mount_name}: {e}"
+            ) from e
 
     def reconnect(self) -> None:
         new_conn = self._open_connection()
