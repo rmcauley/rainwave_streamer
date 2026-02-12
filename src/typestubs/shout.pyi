@@ -1,3 +1,7 @@
+#########################################################################
+# This file was AI generated with no human supervision.
+#########################################################################
+
 from typing import Dict, Optional
 
 SHOUT_AI_BITRATE: int

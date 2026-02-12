@@ -1,3 +1,7 @@
+#########################################################################
+# This file was human written and reviewed by AI.
+#########################################################################
+
 from typing import Literal
 
 import av
@@ -48,6 +52,13 @@ class Encoder:
             self._container.mux(packet)
 
     def close(self) -> None:
-        self.encode(None)  # Flush encoder
-        self._container.close()
+        try:
+            self.encode(None)
+        except Exception:
+            # Shutdown path: don't spam logs if encoder flush fails during teardown.
+            pass
+        try:
+            self._container.close()
+        except Exception:
+            pass
         self._sender.close()

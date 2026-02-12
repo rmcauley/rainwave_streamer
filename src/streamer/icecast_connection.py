@@ -1,4 +1,9 @@
+#########################################################################
+# This file was AI generated with close human supervision.
+#########################################################################
+
 import logging
+from threading import Lock
 from typing import Literal
 
 import shout
@@ -21,7 +26,18 @@ class IcecastConnection:
         *,
         fmt: Literal["mp3", "ogg"],
     ) -> None:
+        self._config = config
+        self._mount = mount
+        self._fmt = fmt
         self.mount_name = mount.mount
+        self._conn_lock = Lock()
+        self._conn = self._open_connection()
+
+    def _open_connection(self) -> shout.Shout:
+        mount = self._mount
+        config = self._config
+        fmt = self._fmt
+
         conn = shout.Shout()
         conn.host = config.host
         conn.port = config.port
@@ -45,17 +61,39 @@ class IcecastConnection:
 
         logging.info(f"Connecting to Icecast mount {mount.mount}...")
         conn.open()
-        self._conn = conn
+        return conn
 
     def send(self, data: bytes) -> None:
-        if data:
+        if not data:
+            return
+        with self._conn_lock:
+            conn = self._conn
+        if conn is None:
+            raise RuntimeError(f"Icecast connection {self.mount_name} is closed.")
+        # Review note: send() intentionally uses a snapshot of the active connection.
+        # During reconnect, this snapshot can be closed concurrently and produce one
+        # transient send failure. ThreadedSender retry/reconnect logic handles this,
+        # and occasional loss in that failure window is acceptable for this daemon.
+        conn.send(data)
+
+    def reconnect(self) -> None:
+        new_conn = self._open_connection()
+        with self._conn_lock:
+            old_conn = self._conn
+            self._conn = new_conn
+        if old_conn is not None:
             try:
-                self._conn.send(data)
-            except Exception as e:
-                logging.error(f"Error sending to {self.mount_name}: {e}")
+                old_conn.close()
+            except Exception:
+                pass
 
     def close(self) -> None:
+        with self._conn_lock:
+            conn = self._conn
+            self._conn = None
+        if conn is None:
+            return
         try:
-            self._conn.close()
+            conn.close()
         except Exception:
             pass
