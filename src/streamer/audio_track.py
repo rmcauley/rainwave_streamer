@@ -36,14 +36,16 @@ class AudioTrackEOFError(Exception):
 class AudioTrackOpenError(Exception):
     path: str
 
-    def __init__(self, path):
+    def __init__(self, path, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.path = path
 
 
 class AudioTrackDecodeError(Exception):
     path: str
 
-    def __init__(self, path):
+    def __init__(self, path, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.path = path
 
 

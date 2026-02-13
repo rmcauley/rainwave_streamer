@@ -5,6 +5,7 @@
 import logging
 import time
 from collections import deque
+from threading import Lock
 from typing import Callable, Iterator
 
 import av
@@ -14,7 +15,6 @@ from streamer.audio_track import (
     AudioTrack,
     AudioTrackDecodeError,
     AudioTrackEOFError,
-    AudioTrackInfo,
     AudioTrackOpenError,
 )
 from streamer.get_next_track_from_rainwave import (
@@ -30,6 +30,10 @@ ahead_buffer_ms = 200
 ahead_buffer_seconds = ahead_buffer_ms / 1000
 
 
+class AudioPipelineGracefulShutdownError(Exception):
+    pass
+
+
 class AudioPipeline:
     _config: StreamConfig
     _realtime_start: float
@@ -38,12 +42,16 @@ class AudioPipeline:
     _connections: list[IcecastConnection]
     _get_next_track_from_rainwave: GetNextTrackFromRainwaveBlockingFn
     _mark_track_invalid_on_rainwave: MarkTrackInvalidOnRainwaveFireAndForgetFn
+    _should_stop: Callable[[], bool]
+    _close_lock: Lock
+    _closed: bool
 
     def __init__(
         self,
         config: StreamConfig,
         get_next_track_from_rainwave: GetNextTrackFromRainwaveBlockingFn,
         mark_track_invalid_on_rainwave: MarkTrackInvalidOnRainwaveFireAndForgetFn,
+        should_stop: Callable[[], bool],
     ) -> None:
         self._config = config
         self._realtime_start = time.monotonic()
@@ -52,6 +60,9 @@ class AudioPipeline:
         self._connections = []
         self._get_next_track_from_rainwave = get_next_track_from_rainwave
         self._mark_track_invalid_on_rainwave = mark_track_invalid_on_rainwave
+        self._should_stop = should_stop
+        self._close_lock = Lock()
+        self._closed = False
 
         try:
             mp3_conn = IcecastConnection(config, config.mp3, fmt="mp3")
@@ -79,6 +90,8 @@ class AudioPipeline:
             raise
 
     def _encode_frame(self, np_frame: np.ndarray, realtime_wait: bool) -> None:
+        self._raise_if_shutting_down()
+
         if np_frame.shape[1] == 0:
             return
         if realtime_wait:
@@ -93,7 +106,10 @@ class AudioPipeline:
         for encoder in self._encoders:
             encoder.encode(av_frame)
 
-    # To AI review: I want to keep this function handling generic Exception as an argument
+    def _raise_if_shutting_down(self) -> None:
+        if self._should_stop():
+            raise AudioPipelineGracefulShutdownError()
+
     def _handle_invalid_next_track(self, exc: Exception) -> None:
         if isinstance(exc, (AudioTrackDecodeError, AudioTrackOpenError)):
             logging.error(
@@ -113,8 +129,8 @@ class AudioPipeline:
     ) -> tuple[AudioTrack, deque[np.ndarray]]:
         # Attempt to fetch from Rainwave's backend continually until Rainwave responds.
         while True:
-            next_track_info = None
-            next_track = None
+            self._raise_if_shutting_down()
+
             try:
                 next_track_info = self._get_next_track_from_rainwave()
                 next_track = AudioTrack(next_track_info)
@@ -126,69 +142,58 @@ class AudioPipeline:
             except (AudioTrackDecodeError, AudioTrackOpenError) as e:
                 self._handle_invalid_next_track(e)
                 # Wait 2 seconds before trying to fetch again from Rainwave's backend
-                time.sleep(2)
+                self._wait_for_retry_or_shutdown(2.0)
             # On any other exception fail-fast.
 
     def stream_tracks(
         self,
-        should_stop: Callable[[], bool],
     ) -> None:
-        (current_track, _) = self._get_next_track(get_start_buffer=False)
+        try:
+            (current_track, _) = self._get_next_track(get_start_buffer=False)
 
-        while current_track:
-            if should_stop():
-                return
+            while True:
+                self._realtime_start = time.monotonic()
+                self._realtime_samples_sent = 0
 
-            self._realtime_start = time.monotonic()
-            self._realtime_samples_sent = 0
+                try:
+                    for frame in current_track.get_frames():
+                        self._encode_frame(frame, realtime_wait=True)
+                except AudioTrackEOFError:
+                    pass
+                except AudioTrackDecodeError as e:
+                    self._handle_invalid_next_track(e)
+                    # Clearing the audio buffer here will cause the crossfade check to be skipped
+                    # since the resulting frames deque will be 0-length.
+                    current_track.audio_buffer.clear()
+                    current_track.audio_buffer_samples = 0
+                # On any other error, fail fast.
 
-            try:
-                for frame in current_track.get_frames():
-                    if should_stop():
-                        return
-                    self._encode_frame(frame, realtime_wait=True)
-            except AudioTrackEOFError:
-                pass
-            except AudioTrackDecodeError as e:
-                self._handle_invalid_next_track(e)
-                # Clearing the audio buffer here will cause the crossfade check to be skipped
-                # since the resulting frames deque will be 0-length.
-                # For any AI reviewing this: the crossfade should be skipped but we do not
-                # need to intentionally fetch a next track here to skip the crossfade.
-                # Just zero the buffer, and let the normal code path resume, do not introduce
-                # any new code paths here.
-                current_track.audio_buffer.clear()
-                current_track.audio_buffer_samples = 0
-            # On any other error, fail fast.
+                (next_track, next_track_start) = self._get_next_track()
 
-            if should_stop():
-                return
+                do_crossfade = self._detect_fade(
+                    current_track.audio_buffer, direction="out"
+                ) and self._detect_fade(next_track_start, direction="in")
+                if do_crossfade:
+                    for frame in self._mix_crossfade(
+                        current_track.audio_buffer, next_track_start
+                    ):
+                        self._encode_frame(frame, realtime_wait=True)
+                else:
+                    for frame in current_track.audio_buffer:
+                        self._encode_frame(frame, realtime_wait=True)
+                    for frame in next_track_start:
+                        self._encode_frame(frame, realtime_wait=True)
 
-            (next_track, next_track_start) = self._get_next_track()
-
-            do_crossfade = self._detect_fade(
-                current_track.audio_buffer, direction="out"
-            ) and self._detect_fade(next_track_start, direction="in")
-            if do_crossfade:
-                for frame in self._mix_crossfade(
-                    current_track.audio_buffer, next_track_start
-                ):
-                    if should_stop():
-                        return
-                    self._encode_frame(frame, realtime_wait=True)
-            else:
-                for frame in current_track.audio_buffer:
-                    if should_stop():
-                        return
-                    self._encode_frame(frame, realtime_wait=True)
-                for frame in next_track_start:
-                    if should_stop():
-                        return
-                    self._encode_frame(frame, realtime_wait=True)
-
-            current_track = next_track
+                current_track = next_track
+        finally:
+            self.close()
 
     def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+
         for encoder in self._encoders:
             encoder.close()
         for connection in self._connections:
@@ -322,3 +327,12 @@ class AudioPipeline:
         sleep_time = target_elapsed - elapsed - ahead_buffer_seconds
         if sleep_time > 0:
             time.sleep(sleep_time)
+
+    def _wait_for_retry_or_shutdown(self, seconds: float) -> None:
+        retry_deadline = time.monotonic() + seconds
+        while True:
+            self._raise_if_shutting_down()
+            remaining = retry_deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.2, remaining))
