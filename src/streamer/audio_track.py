@@ -84,7 +84,8 @@ class AudioTrack:
     # I'd use pyav, but pyav/ffmpeg's resampler and graph have memory leaks. :(
     _resampler: soxr.ResampleStream
     _input_channels: int
-    _linear_gain: float
+    _linear_gain: np.float32
+    _flush_chunk: np.ndarray
 
     # Decoded audio buffer so we can easily and safely trim silence.
     # Will be kept at approx lookahead_seconds length.
@@ -95,7 +96,7 @@ class AudioTrack:
         logging.info(f"Opening track: {track_info.path}")
         self.path = track_info.path
         self._gain_db = track_info.gain_db
-        self._linear_gain = math.pow(10.0, self._gain_db / 20.0)
+        self._linear_gain = np.float32(math.pow(10.0, self._gain_db / 20.0))
 
         self.audio_buffer = deque()
         self.audio_buffer_samples = 0
@@ -115,6 +116,7 @@ class AudioTrack:
             if input_rate_value is None or input_rate_value <= 0:
                 raise AudioTrackOpenError(self.path, "Invalid source sample rate.")
             input_rate = float(input_rate_value)
+            self._flush_chunk = np.empty((0, self._input_channels), dtype=np.float32)
 
             self._resampler = soxr.ResampleStream(
                 in_rate=input_rate,
@@ -244,14 +246,19 @@ class AudioTrack:
 
     def _to_frames_by_channels(self, frame: AudioFrame) -> np.ndarray:
         # to_ndarray gives planar audio as [channels, samples]; soxr expects [samples, channels].
-        array = frame.to_ndarray().astype(np.float32, copy=False)
+        array = frame.to_ndarray()
+        if array.dtype != np.float32:
+            array = array.astype(np.float32, copy=False)
         if array.ndim == 1:
             if self._input_channels != 1:
                 raise AudioTrackDecodeError(
                     self.path,
                     f"Unexpected mono frame with {self._input_channels} channels.",
                 )
-            return np.ascontiguousarray(array.reshape(-1, 1))
+            mono = array.reshape(-1, 1)
+            if not mono.flags.c_contiguous:
+                return np.ascontiguousarray(mono)
+            return mono
 
         if array.ndim != 2:
             raise AudioTrackDecodeError(
@@ -259,15 +266,19 @@ class AudioTrack:
             )
 
         if frame.format.is_planar:
-            return np.ascontiguousarray(array.T)
+            frames_by_channels = array.T
+        elif array.shape[1] == self._input_channels:
+            frames_by_channels = array
+        else:
+            raise AudioTrackDecodeError(
+                self.path,
+                f"Unexpected interleaved frame shape {array.shape} for {self._input_channels} channels.",
+            )
 
-        if array.shape[1] == self._input_channels:
-            return np.ascontiguousarray(array)
+        if not frames_by_channels.flags.c_contiguous:
+            return np.ascontiguousarray(frames_by_channels)
 
-        raise AudioTrackDecodeError(
-            self.path,
-            f"Unexpected interleaved frame shape {array.shape} for {self._input_channels} channels.",
-        )
+        return frames_by_channels
 
     def _match_output_channels(self, array: np.ndarray) -> np.ndarray:
         # Pipeline expects [channels, samples] with stream_constants.channels.
@@ -283,9 +294,7 @@ class AudioTrack:
 
     def _get_resampled_frames(self, frame: AudioFrame | None) -> Iterator[np.ndarray]:
         if frame is None:
-            resampled = self._resampler.resample_chunk(
-                np.empty((0, self._input_channels), dtype=np.float32), last=True
-            )
+            resampled = self._resampler.resample_chunk(self._flush_chunk, last=True)
         else:
             source = self._to_frames_by_channels(frame)
             resampled = self._resampler.resample_chunk(source, last=False)
@@ -293,7 +302,10 @@ class AudioTrack:
         if resampled.size <= 0:
             return
 
-        resampled = resampled.astype(np.float32, copy=False)
-        resampled *= self._linear_gain
+        if self._linear_gain != np.float32(1.0):
+            np.multiply(resampled, self._linear_gain, out=resampled, casting="unsafe")
         resampled = self._match_output_channels(resampled)
-        yield np.ascontiguousarray(resampled.T)
+        output = resampled.T
+        if not output.flags.c_contiguous:
+            output = np.ascontiguousarray(output)
+        yield output

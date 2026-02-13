@@ -99,8 +99,13 @@ class AudioPipeline:
         if realtime_wait:
             self._realtime_wait(np_frame.shape[1])
 
+        if np_frame.dtype != np.float32:
+            np_frame = np_frame.astype(np.float32, copy=False)
+        if not np_frame.flags.c_contiguous:
+            np_frame = np.ascontiguousarray(np_frame)
+
         av_frame = av.AudioFrame.from_ndarray(
-            np_frame.astype(np.float32, copy=False),
+            np_frame,
             format="fltp",
             layout=layout,
         )
@@ -314,7 +319,10 @@ class AudioPipeline:
                 )
             fade_out = 1.0 - fade_in
             mixed_samples += frame_samples
-            yield tail_frame * fade_out + head_frame * fade_in
+            np.multiply(tail_frame, fade_out, out=tail_frame, casting="unsafe")
+            np.multiply(head_frame, fade_in, out=head_frame, casting="unsafe")
+            tail_frame += head_frame
+            yield tail_frame
 
         # Flush any head frames that were not part of the overlap.
         while head:
