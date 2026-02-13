@@ -1,5 +1,5 @@
 #########################################################################
-# This file was human-written.
+# This file was primarily human-written, with audio resampling done by AI.
 #########################################################################
 
 from collections import deque
@@ -11,11 +11,11 @@ from typing import Iterator
 import av
 from av import AudioFrame, AudioStream
 from av.error import EOFError
-from av.audio.resampler import AudioResampler
 from av.container import InputContainer
 import numpy as np
+import soxr
 
-from streamer.stream_constants import sample_rate, layout
+from streamer.stream_constants import sample_rate, channels
 
 # Length of crossfade, used to make sure our buffer sizes for samples
 # are at least this long.
@@ -80,6 +80,12 @@ class AudioTrack:
     # and interleaving multiple decoded copies of the track.
     _decoder: Iterator[AudioFrame]
 
+    # Required for soxr resampling.
+    # I'd use pyav, but pyav/ffmpeg's resampler and graph have memory leaks. :(
+    _resampler: soxr.ResampleStream
+    _input_channels: int
+    _linear_gain: float
+
     # Decoded audio buffer so we can easily and safely trim silence.
     # Will be kept at approx lookahead_seconds length.
     audio_buffer: deque[np.ndarray]
@@ -89,15 +95,7 @@ class AudioTrack:
         logging.info(f"Opening track: {track_info.path}")
         self.path = track_info.path
         self._gain_db = track_info.gain_db
-
-        # AudioResampler is required to maintain 48kHz for Ogg Opus.
-        # It also maintains internal state and so must be instantiated
-        # per track.
-        self._resampler = AudioResampler(
-            format="fltp",
-            layout=layout,
-            rate=sample_rate,
-        )
+        self._linear_gain = math.pow(10.0, self._gain_db / 20.0)
 
         self.audio_buffer = deque()
         self.audio_buffer_samples = 0
@@ -106,8 +104,29 @@ class AudioTrack:
             self._container = av.open(track_info.path)
             self._stream = self._container.streams.audio[0]
             self._decoder = self._container.decode(self._stream)
+
+            self._input_channels = self._stream.codec_context.channels or 0
+            if self._input_channels <= 0:
+                raise AudioTrackOpenError(self.path, "Invalid source channel count.")
+
+            input_rate_value = (
+                self._stream.rate or self._stream.codec_context.sample_rate
+            )
+            if input_rate_value is None or input_rate_value <= 0:
+                raise AudioTrackOpenError(self.path, "Invalid source sample rate.")
+            input_rate = float(input_rate_value)
+
+            self._resampler = soxr.ResampleStream(
+                in_rate=input_rate,
+                out_rate=float(sample_rate),
+                num_channels=self._input_channels,
+                dtype="float32",
+                quality="HQ",
+            )
         except Exception as e:
             logging.error(f"Failed to open track {track_info.path}: {e}")
+            if self._container:
+                self._container.close()
             raise AudioTrackOpenError(self.path) from e
 
     def get_start_buffer(self) -> deque[np.ndarray]:
@@ -149,16 +168,6 @@ class AudioTrack:
 
         return start_buffer
 
-    def _get_resampled_frames(self, frame: AudioFrame | None) -> Iterator[np.ndarray]:
-        # AudioResampler can yield multiple new AudioFrames per input frame, so we must loop.
-        for resampled_frame in self._resampler.resample(frame):
-            # We only need to process this frame if it has more than 0 samples in it
-            if resampled_frame.samples > 0:
-                # This business is our replaygain application.
-                yield resampled_frame.to_ndarray() * math.pow(
-                    10.0, self._gain_db / 20.0
-                )
-
     # ffmpeg calls encoded chunks "packets"; here we work with decoded frames.
     def _decode_next_frame(self) -> Iterator[np.ndarray]:
         # Note from AI:
@@ -169,7 +178,7 @@ class AudioTrack:
             decoded_frame = next(self._decoder)
         except StopIteration as e:
             raise AudioTrackNoMoreFramesError() from e
-        # AudioResampler can yield multiple new AudioFrames per input frame, so we must loop.
+        # soxr can output variable-length chunks; keep decode/resample boundaries isolated.
         for resampled_frame in self._get_resampled_frames(decoded_frame):
             yield resampled_frame
 
@@ -211,7 +220,7 @@ class AudioTrack:
         finally:
             self._container.close()
 
-        # Drain the resampler frame queue by using None to flush the AudioResampler
+        # Drain the soxr queue with a final flush call.
         for frame in self._get_resampled_frames(None):
             self.audio_buffer.append(frame)
             self.audio_buffer_samples += frame.shape[1]
@@ -228,3 +237,63 @@ class AudioTrack:
 
         # Data is purposefully left in the buffer at this point for the pipeline to use for crossfading.
         raise AudioTrackEOFError()
+
+    #########################################################################
+    # Beware: below is AI slop territory
+    #########################################################################
+
+    def _to_frames_by_channels(self, frame: AudioFrame) -> np.ndarray:
+        # to_ndarray gives planar audio as [channels, samples]; soxr expects [samples, channels].
+        array = frame.to_ndarray().astype(np.float32, copy=False)
+        if array.ndim == 1:
+            if self._input_channels != 1:
+                raise AudioTrackDecodeError(
+                    self.path,
+                    f"Unexpected mono frame with {self._input_channels} channels.",
+                )
+            return np.ascontiguousarray(array.reshape(-1, 1))
+
+        if array.ndim != 2:
+            raise AudioTrackDecodeError(
+                self.path, f"Unexpected frame shape: {array.shape}"
+            )
+
+        if frame.format.is_planar:
+            return np.ascontiguousarray(array.T)
+
+        if array.shape[1] == self._input_channels:
+            return np.ascontiguousarray(array)
+
+        raise AudioTrackDecodeError(
+            self.path,
+            f"Unexpected interleaved frame shape {array.shape} for {self._input_channels} channels.",
+        )
+
+    def _match_output_channels(self, array: np.ndarray) -> np.ndarray:
+        # Pipeline expects [channels, samples] with stream_constants.channels.
+        current_channels = array.shape[1]
+        if current_channels == channels:
+            return array
+        if current_channels == 1 and channels == 2:
+            return np.repeat(array, 2, axis=1)
+        if current_channels > channels:
+            return array[:, :channels]
+        pad = np.repeat(array[:, -1:], channels - current_channels, axis=1)
+        return np.concatenate([array, pad], axis=1)
+
+    def _get_resampled_frames(self, frame: AudioFrame | None) -> Iterator[np.ndarray]:
+        if frame is None:
+            resampled = self._resampler.resample_chunk(
+                np.empty((0, self._input_channels), dtype=np.float32), last=True
+            )
+        else:
+            source = self._to_frames_by_channels(frame)
+            resampled = self._resampler.resample_chunk(source, last=False)
+
+        if resampled.size <= 0:
+            return
+
+        resampled = resampled.astype(np.float32, copy=False)
+        resampled *= self._linear_gain
+        resampled = self._match_output_channels(resampled)
+        yield np.ascontiguousarray(resampled.T)
