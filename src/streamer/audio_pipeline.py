@@ -119,7 +119,7 @@ class AudioPipeline:
             )
             self._mark_track_invalid_on_rainwave(exc.path)
         else:
-            logging.exception("Attempt to get a track from Rainwave failed", exc)
+            logging.error("Attempt to get a track from Rainwave failed", exc_info=exc)
             # If we don't know what error occurred, it should be re-thrown up the stack
             # to fail fast.
             raise
