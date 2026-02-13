@@ -4,6 +4,7 @@
 
 import logging
 import queue
+from collections.abc import Callable
 from threading import Condition, Event, Thread
 
 from streamer.icecast_connection import IcecastConnection, IcecastConnectionError
@@ -16,11 +17,15 @@ class ThreadedSender:
     """
 
     def __init__(
-        self, conn: IcecastConnection, max_buffer_bytes: int = 64 * 1024
+        self,
+        conn: IcecastConnection,
+        max_buffer_bytes: int = 64 * 1024,
+        should_stop: Callable[[], bool] = lambda: False,
     ) -> None:
         self._conn = conn
         self._queue: queue.Queue[bytes | None] = queue.Queue()
         self._max_buffer_bytes = max_buffer_bytes
+        self._should_stop = should_stop
         self._buffered_bytes = 0
         self._buffer_cond = Condition()
         self._stop_event = Event()
@@ -38,9 +43,15 @@ class ThreadedSender:
                     break
                 if data is None:
                     break
-                self._send_with_retry(data)
+                self._conn.send(data)
             except queue.Empty:
                 continue
+            except IcecastConnectionError as send_error:
+                if self._stop_event.is_set():
+                    break
+                logging.error(
+                    "Sender failed for %s: %s", self._conn.mount_name, send_error
+                )
             except Exception as e:
                 logging.error(f"Sender thread error: {e}")
             finally:
@@ -49,77 +60,18 @@ class ThreadedSender:
                         self._buffered_bytes = max(0, self._buffered_bytes - len(data))
                         self._buffer_cond.notify_all()
 
-    def _send_with_retry(self, data: bytes) -> None:
-        # Review note: this streamer is intended to run as a daemon and retry forever.
-        # We intentionally keep retrying send/reconnect until shutdown is requested.
-        # IcecastConnection.reconnect() may block while network/server is unavailable.
-        retry_delay_seconds = 2.0
-        while not self._stop_event.is_set():
-            try:
-                self._conn.send(data)
-                return
-            except IcecastConnectionError as send_error:
-                logging.warning(
-                    "Send failed to %s, retrying: %s",
-                    self._conn.mount_name,
-                    send_error,
-                )
-                if self._stop_event.wait(timeout=retry_delay_seconds):
-                    return
-                try:
-                    if not self._reconnect_with_shutdown_support():
-                        return
-                    logging.info(
-                        "Reconnected to Icecast mount %s.", self._conn.mount_name
-                    )
-                except IcecastConnectionError as reconnect_error:
-                    logging.warning(
-                        "Reconnect failed for %s, will retry: %s",
-                        self._conn.mount_name,
-                        reconnect_error,
-                    )
-
-    def _reconnect_with_shutdown_support(self) -> bool:
-        reconnect_done = Event()
-        reconnect_error: list[Exception] = []
-
-        def reconnect_target() -> None:
-            try:
-                self._conn.reconnect()
-            except Exception as e:
-                reconnect_error.append(e)
-            finally:
-                reconnect_done.set()
-
-        reconnect_thread = Thread(
-            target=reconnect_target,
-            daemon=True,
-            name=f"Reconnect-{self._conn.mount_name}",
-        )
-        reconnect_thread.start()
-
-        while not reconnect_done.wait(timeout=0.25):
-            if self._stop_event.is_set():
-                return False
-
-        if reconnect_error:
-            error = reconnect_error[0]
-            if isinstance(error, IcecastConnectionError):
-                raise error
-            raise IcecastConnectionError(
-                f"Unexpected reconnect error for {self._conn.mount_name}: {error}"
-            ) from error
-        return True
-
     def write(self, data: bytes) -> int:
         if not data:
             return 0
-        if self._stop_event.is_set():
+        if self._stop_event.is_set() or self._should_stop():
             return len(data)
 
         data_len = len(data)
         with self._buffer_cond:
             while not self._stop_event.is_set():
+                if self._should_stop():
+                    # Shutdown path: bypass backpressure so the encoder/pipeline can unwind.
+                    return len(data)
                 would_overflow = self._buffered_bytes + data_len > self._max_buffer_bytes
                 # Allow one oversized packet through only when buffer is empty.
                 oversize_allowed = (
@@ -130,6 +82,8 @@ class ThreadedSender:
                 self._buffer_cond.wait(timeout=0.25)
 
             if self._stop_event.is_set():
+                return len(data)
+            if self._should_stop():
                 return len(data)
 
             self._buffered_bytes += data_len

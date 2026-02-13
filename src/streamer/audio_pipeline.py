@@ -71,6 +71,7 @@ class AudioPipeline:
                 mp3_conn,
                 codec_name="mp3",
                 fmt="mp3",
+                should_stop=self._should_stop,
             )
             self._encoders.append(mp3_encoder)
 
@@ -80,6 +81,7 @@ class AudioPipeline:
                 opus_conn,
                 codec_name="opus",
                 fmt="ogg",
+                should_stop=self._should_stop,
             )
             self._encoders.append(opus_encoder)
         except Exception:

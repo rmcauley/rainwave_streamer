@@ -2,6 +2,7 @@
 # This file was human written and reviewed by AI.
 #########################################################################
 
+from collections.abc import Callable
 from typing import Literal
 
 import av
@@ -20,8 +21,9 @@ class Encoder:
         *,
         codec_name: Literal["mp3", "opus"],
         fmt: Literal["mp3", "ogg"],
+        should_stop: Callable[[], bool] = lambda: False,
     ) -> None:
-        self._sender = ThreadedSender(conn)
+        self._sender = ThreadedSender(conn, should_stop=should_stop)
         try:
             # PyAV writes to our ThreadedSender which looks like a file
             self._container = av.open(self._sender, mode="w", format=fmt)

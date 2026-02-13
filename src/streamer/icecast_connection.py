@@ -1,9 +1,9 @@
 #########################################################################
-# This file was AI generated with close human supervision.
+# This file was AI generated with some human supervision.
 #########################################################################
 
 import logging
-from threading import Lock
+from threading import Event, Lock, Thread
 from typing import Literal
 
 import shout
@@ -35,7 +35,12 @@ class IcecastConnection:
         self._fmt = fmt
         self.mount_name = mount.mount
         self._conn_lock = Lock()
+        self._reconnect_lock = Lock()
         self._closed = False
+        self._closed_event = Event()
+        self._reconnect_done = Event()
+        self._reconnect_thread: Thread | None = None
+        self._reconnect_error: Exception | None = None
         self._conn: shout.Shout | None = self._open_connection()
 
     def _open_connection(self) -> shout.Shout:
@@ -76,20 +81,86 @@ class IcecastConnection:
     def send(self, data: bytes) -> None:
         if not data:
             return
-        with self._conn_lock:
-            conn = self._conn
-        if conn is None:
-            raise RuntimeError(f"Icecast connection {self.mount_name} is closed.")
-        # Review note: send() intentionally uses a snapshot of the active connection.
-        # During reconnect, this snapshot can be closed concurrently and produce one
-        # transient send failure. ThreadedSender retry/reconnect logic handles this,
-        # and occasional loss in that failure window is acceptable for this daemon.
+        retry_delay_seconds = 2.0
+        while True:
+            with self._conn_lock:
+                conn = self._conn
+            if conn is None:
+                raise IcecastConnectionError(
+                    f"Icecast connection {self.mount_name} is closed."
+                )
+
+            try:
+                conn.send(data)
+                return
+            except Exception as send_error:
+                if self._closed_event.is_set():
+                    raise IcecastConnectionError(
+                        f"Failed sending packet to {self.mount_name}: connection closed."
+                    ) from send_error
+                logging.warning(
+                    "Send failed to %s, reconnecting: %s",
+                    self.mount_name,
+                    send_error,
+                )
+                try:
+                    if not self._reconnect_with_shutdown_support():
+                        raise IcecastConnectionError(
+                            f"Failed sending packet to {self.mount_name}: connection closed."
+                        ) from send_error
+                    logging.info("Reconnected to Icecast mount %s.", self.mount_name)
+                    # Re-attempt send immediately after a successful reconnect.
+                    continue
+                except IcecastConnectionError as reconnect_error:
+                    logging.warning(
+                        "Reconnect failed for %s, will retry: %s",
+                        self.mount_name,
+                        reconnect_error,
+                    )
+                if self._closed_event.wait(timeout=retry_delay_seconds):
+                    raise IcecastConnectionError(
+                        f"Failed sending packet to {self.mount_name}: connection closed."
+                    ) from send_error
+
+    def _run_reconnect(self) -> None:
         try:
-            conn.send(data)
+            self.reconnect()
+            with self._reconnect_lock:
+                self._reconnect_error = None
         except Exception as e:
+            with self._reconnect_lock:
+                self._reconnect_error = e
+        finally:
+            self._reconnect_done.set()
+
+    def _reconnect_with_shutdown_support(self) -> bool:
+        with self._reconnect_lock:
+            reconnect_thread = self._reconnect_thread
+            if reconnect_thread is None or not reconnect_thread.is_alive():
+                self._reconnect_error = None
+                self._reconnect_done.clear()
+                reconnect_thread = Thread(
+                    target=self._run_reconnect,
+                    daemon=True,
+                    name=f"IcecastReconnect-{self.mount_name}",
+                )
+                self._reconnect_thread = reconnect_thread
+                reconnect_thread.start()
+
+        while not self._reconnect_done.wait(timeout=0.25):
+            if self._closed_event.is_set():
+                return False
+
+        with self._reconnect_lock:
+            reconnect_error = self._reconnect_error
+
+        if reconnect_error is not None:
+            if isinstance(reconnect_error, IcecastConnectionError):
+                raise reconnect_error
             raise IcecastConnectionError(
-                f"Failed sending packet to {self.mount_name}: {e}"
-            ) from e
+                f"Unexpected reconnect error for {self.mount_name}: {reconnect_error}"
+            ) from reconnect_error
+        return True
 
     def reconnect(self) -> None:
         new_conn = self._open_connection()
@@ -118,11 +189,23 @@ class IcecastConnection:
             if self._closed:
                 return
             self._closed = True
+            self._closed_event.set()
             conn = self._conn
             self._conn = None
-        if conn is None:
-            return
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        with self._reconnect_lock:
+            reconnect_thread = self._reconnect_thread
+        if reconnect_thread is not None and reconnect_thread.is_alive():
+            # Review note: reconnect can block inside native I/O and cannot be force-cancelled
+            # from Python. Process exit will reclaim these resources.
+            reconnect_thread.join(timeout=2.0)
+            if reconnect_thread.is_alive():
+                logging.warning(
+                    "Reconnect thread for %s did not stop within 2 seconds.",
+                    self.mount_name,
+                )
