@@ -33,6 +33,11 @@ class AudioTrackEOFError(Exception):
     pass
 
 
+# Used internally to signal that ffmpeg has raised StopIteration
+class AudioTrackNoMoreFramesError(Exception):
+    pass
+
+
 class AudioTrackOpenError(Exception):
     path: str
 
@@ -156,9 +161,14 @@ class AudioTrack:
 
     # ffmpeg calls encoded chunks "packets"; here we work with decoded frames.
     def _decode_next_frame(self) -> Iterator[np.ndarray]:
-        # Get the next decoded frame from pyav.  Will throw StopIteration or EOFError
-        # when the file has reached its end.
-        decoded_frame = next(self._decoder)
+        # Note from AI:
+        # _decode_next_frame is a generator, so StopIteration must not escape from it
+        # (PEP 479 converts that into RuntimeError). Translate decoder exhaustion into
+        # EOFError so callers can handle end-of-track normally.
+        try:
+            decoded_frame = next(self._decoder)
+        except StopIteration as e:
+            raise AudioTrackNoMoreFramesError() from e
         # AudioResampler can yield multiple new AudioFrames per input frame, so we must loop.
         for resampled_frame in self._get_resampled_frames(decoded_frame):
             yield resampled_frame
@@ -174,7 +184,7 @@ class AudioTrack:
             self.audio_buffer_samples -= popped.shape[1]
 
     def get_frames(self) -> Iterator[np.ndarray]:
-        # This try block is for when StopIteration or EOFError has occurred.  Then we know
+        # This try block is for when EOFError has occurred. Then we know
         # we have reached the end of the MP3.
         try:
             # Fill in the main buffer to the number of seconds required by the lookahead.
@@ -183,7 +193,7 @@ class AudioTrack:
                     self.audio_buffer.append(frame)
                     self.audio_buffer_samples += frame.shape[1]
 
-            # Now loop until the end of the song, upon which pyav will throw a StopIteration or EOFError.
+            # Now loop until the end of the song, upon which pyav exhaustion is surfaced as EOFError.
             while True:
                 for frame in self._decode_next_frame():
                     # For each frame we add to the end of buffer...
@@ -193,7 +203,7 @@ class AudioTrack:
                     yield_frame = self.audio_buffer.popleft()
                     self.audio_buffer_samples -= yield_frame.shape[1]
                     yield yield_frame
-        except (StopIteration, EOFError):
+        except (EOFError, AudioTrackNoMoreFramesError):
             logging.debug(f"Finished decoding {self.path}")
         except Exception as e:
             logging.error(f"Error decoding {self.path}: {e}")
