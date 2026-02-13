@@ -263,6 +263,7 @@ dependencies = [
     { name = "orjson" },
     { name = "psutil" },
     { name = "python-shout" },
+    { name = "types-psutil" },
 ]
 
 [package.dev-dependencies]
@@ -278,12 +279,22 @@ requires-dist = [
     { name = "orjson", specifier = "==3.11.7" },
     { name = "psutil", specifier = "==7.2.2" },
     { name = "python-shout", specifier = "==0.2.8" },
+    { name = "types-psutil", specifier = ">=7.2.2.20260130" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "black", specifier = "==26.1.0" },
     { name = "mypy", specifier = "==1.19.1" },
+]
+
+[[package]]
+name = "types-psutil"
+version = "7.2.2.20260130"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/69/14/fc5fb0a6ddfadf68c27e254a02ececd4d5c7fdb0efcb7e7e917a183497fb/types_psutil-7.2.2.20260130.tar.gz", hash = "sha256:15b0ab69c52841cf9ce3c383e8480c620a4d13d6a8e22b16978ebddac5590950", size = 26535, upload-time = "2026-01-30T03:58:14.116Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/17/d7/60974b7e31545d3768d1770c5fe6e093182c3bfd819429b33133ba6b3e89/types_psutil-7.2.2.20260130-py3-none-any.whl", hash = "sha256:15523a3caa7b3ff03ac7f9b78a6470a59f88f48df1d74a39e70e06d2a99107da", size = 32876, upload-time = "2026-01-30T03:58:13.172Z" },
 ]
 
 [[package]]

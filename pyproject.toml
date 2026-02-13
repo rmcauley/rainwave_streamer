@@ -10,6 +10,7 @@ dependencies = [
     "orjson==3.11.7",
     "python-shout==0.2.8",
     "psutil==7.2.2",
+    "types-psutil>=7.2.2.20260130",
 ]
 
 [build-system]
