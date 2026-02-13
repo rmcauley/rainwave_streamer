@@ -8,7 +8,6 @@ from collections import deque
 from threading import Lock
 from typing import Callable, Iterator
 
-import av
 import numpy as np
 
 from streamer.audio_track import (
@@ -21,7 +20,7 @@ from streamer.get_next_track_from_rainwave import (
     GetNextTrackFromRainwaveBlockingFn,
     MarkTrackInvalidOnRainwaveFireAndForgetFn,
 )
-from streamer.stream_constants import sample_rate, channels, layout
+from streamer.stream_constants import sample_rate, channels
 from streamer.encoder import Encoder
 from streamer.icecast_connection import IcecastConnection
 from streamer.stream_config import StreamConfig
@@ -70,7 +69,6 @@ class AudioPipeline:
             mp3_encoder = Encoder(
                 mp3_conn,
                 codec_name="mp3",
-                fmt="mp3",
                 should_stop=self._should_stop,
             )
             self._encoders.append(mp3_encoder)
@@ -80,7 +78,6 @@ class AudioPipeline:
             opus_encoder = Encoder(
                 opus_conn,
                 codec_name="opus",
-                fmt="ogg",
                 should_stop=self._should_stop,
             )
             self._encoders.append(opus_encoder)
@@ -101,17 +98,13 @@ class AudioPipeline:
 
         if np_frame.dtype != np.float32:
             np_frame = np_frame.astype(np.float32, copy=False)
-        if not np_frame.flags.c_contiguous:
-            np_frame = np.ascontiguousarray(np_frame)
+        interleaved = np_frame.T
+        if not interleaved.flags.c_contiguous:
+            interleaved = np.ascontiguousarray(interleaved)
+        pcm_frame_bytes = interleaved.tobytes()
 
-        av_frame = av.AudioFrame.from_ndarray(
-            np_frame,
-            format="fltp",
-            layout=layout,
-        )
-        av_frame.sample_rate = sample_rate
         for encoder in self._encoders:
-            encoder.encode(av_frame)
+            encoder.encode(pcm_frame_bytes)
 
     def _raise_if_shutting_down(self) -> None:
         if self._should_stop():

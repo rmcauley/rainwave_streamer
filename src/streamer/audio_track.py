@@ -8,10 +8,7 @@ import logging
 import math
 from typing import Iterator
 
-import av
-from av import AudioFrame, AudioStream
-from av.error import EOFError
-from av.container import InputContainer
+import mad
 import numpy as np
 import soxr
 
@@ -71,17 +68,10 @@ class AudioTrack:
     path: str
     _gain_db: float
 
-    # pyav container (basically the MP3 file itself)
-    _container: InputContainer
-    # The (presumably) MP3 stream coming from pyav from within the container
-    _stream: AudioStream
-    # A single iterator to run over each decoded frame from pyav.
-    # Do not use multiple iterators/decoders or you wind up decoding twice
-    # and interleaving multiple decoded copies of the track.
-    _decoder: Iterator[AudioFrame]
+    # MP3 decoder for this track.
+    _decoder: mad.MadFile
 
     # Required for soxr resampling.
-    # I'd use pyav, but pyav/ffmpeg's resampler and graph have memory leaks. :(
     _resampler: soxr.ResampleStream
     _input_channels: int
     _linear_gain: np.float32
@@ -102,17 +92,21 @@ class AudioTrack:
         self.audio_buffer_samples = 0
 
         try:
-            self._container = av.open(track_info.path)
-            self._stream = self._container.streams.audio[0]
-            self._decoder = self._container.decode(self._stream)
-
-            self._input_channels = self._stream.codec_context.channels or 0
+            self._decoder = mad.MadFile(track_info.path)
+            decode_mode = self._decoder.mode()
+            if decode_mode == mad.MODE_SINGLE_CHANNEL:
+                self._input_channels = 1
+            else:
+                self._input_channels = 2
+            if self._input_channels > channels:
+                raise AudioTrackOpenError(
+                    self.path,
+                    f"Unsupported channel count {self._input_channels}.",
+                )
             if self._input_channels <= 0:
                 raise AudioTrackOpenError(self.path, "Invalid source channel count.")
 
-            input_rate_value = (
-                self._stream.rate or self._stream.codec_context.sample_rate
-            )
+            input_rate_value = self._decoder.samplerate()
             if input_rate_value is None or input_rate_value <= 0:
                 raise AudioTrackOpenError(self.path, "Invalid source sample rate.")
             input_rate = float(input_rate_value)
@@ -127,8 +121,6 @@ class AudioTrack:
             )
         except Exception as e:
             logging.error(f"Failed to open track {track_info.path}: {e}")
-            if self._container:
-                self._container.close()
             raise AudioTrackOpenError(self.path) from e
 
     def get_start_buffer(self) -> deque[np.ndarray]:
@@ -165,23 +157,16 @@ class AudioTrack:
                 self.path,
                 e,
             )
-            self._container.close()
             raise AudioTrackDecodeError(self.path) from e
 
         return start_buffer
 
     # ffmpeg calls encoded chunks "packets"; here we work with decoded frames.
     def _decode_next_frame(self) -> Iterator[np.ndarray]:
-        # Note from AI:
-        # _decode_next_frame is a generator, so StopIteration must not escape from it
-        # (PEP 479 converts that into RuntimeError). Translate decoder exhaustion into
-        # EOFError so callers can handle end-of-track normally.
-        try:
-            decoded_frame = next(self._decoder)
-        except StopIteration as e:
-            raise AudioTrackNoMoreFramesError() from e
-        # soxr can output variable-length chunks; keep decode/resample boundaries isolated.
-        for resampled_frame in self._get_resampled_frames(decoded_frame):
+        chunk = self._decoder.read()
+        if chunk is None:
+            raise AudioTrackNoMoreFramesError()
+        for resampled_frame in self._get_resampled_frames(chunk):
             yield resampled_frame
 
     def _trim_trailing_silence(self) -> None:
@@ -195,8 +180,7 @@ class AudioTrack:
             self.audio_buffer_samples -= popped.shape[1]
 
     def get_frames(self) -> Iterator[np.ndarray]:
-        # This try block is for when EOFError has occurred. Then we know
-        # we have reached the end of the MP3.
+        # This try block is for when the MP3 decoder reaches end-of-file.
         try:
             # Fill in the main buffer to the number of seconds required by the lookahead.
             while self.audio_buffer_samples < (lookahead_seconds * sample_rate):
@@ -204,7 +188,7 @@ class AudioTrack:
                     self.audio_buffer.append(frame)
                     self.audio_buffer_samples += frame.shape[1]
 
-            # Now loop until the end of the song, upon which pyav exhaustion is surfaced as EOFError.
+            # Now loop until the decoder reports end-of-file.
             while True:
                 for frame in self._decode_next_frame():
                     # For each frame we add to the end of buffer...
@@ -214,13 +198,11 @@ class AudioTrack:
                     yield_frame = self.audio_buffer.popleft()
                     self.audio_buffer_samples -= yield_frame.shape[1]
                     yield yield_frame
-        except (EOFError, AudioTrackNoMoreFramesError):
+        except AudioTrackNoMoreFramesError:
             logging.debug(f"Finished decoding {self.path}")
         except Exception as e:
             logging.error(f"Error decoding {self.path}: {e}")
             raise AudioTrackDecodeError(self.path) from e
-        finally:
-            self._container.close()
 
         # Drain the soxr queue with a final flush call.
         for frame in self._get_resampled_frames(None):
@@ -244,40 +226,23 @@ class AudioTrack:
     # Beware: below is AI slop territory
     #########################################################################
 
-    def _to_frames_by_channels(self, frame: AudioFrame) -> np.ndarray:
-        # to_ndarray gives planar audio as [channels, samples]; soxr expects [samples, channels].
-        array = frame.to_ndarray()
-        if array.dtype != np.float32:
-            array = array.astype(np.float32, copy=False)
-        if array.ndim == 1:
-            if self._input_channels != 1:
-                raise AudioTrackDecodeError(
-                    self.path,
-                    f"Unexpected mono frame with {self._input_channels} channels.",
-                )
-            mono = array.reshape(-1, 1)
-            if not mono.flags.c_contiguous:
-                return np.ascontiguousarray(mono)
-            return mono
+    def _to_frames_by_channels(self, chunk: bytearray) -> np.ndarray:
+        # python-mad yields signed 16-bit interleaved PCM.
+        samples_i16 = np.frombuffer(chunk, dtype=np.int16)
+        if samples_i16.size == 0:
+            return np.empty((0, self._input_channels), dtype=np.float32)
 
-        if array.ndim != 2:
-            raise AudioTrackDecodeError(
-                self.path, f"Unexpected frame shape: {array.shape}"
-            )
+        total_frames = samples_i16.size // self._input_channels
+        if total_frames <= 0:
+            return np.empty((0, self._input_channels), dtype=np.float32)
 
-        if frame.format.is_planar:
-            frames_by_channels = array.T
-        elif array.shape[1] == self._input_channels:
-            frames_by_channels = array
-        else:
-            raise AudioTrackDecodeError(
-                self.path,
-                f"Unexpected interleaved frame shape {array.shape} for {self._input_channels} channels.",
-            )
+        usable_samples = total_frames * self._input_channels
+        if usable_samples != samples_i16.size:
+            samples_i16 = samples_i16[:usable_samples]
 
-        if not frames_by_channels.flags.c_contiguous:
-            return np.ascontiguousarray(frames_by_channels)
-
+        interleaved = samples_i16.reshape(total_frames, self._input_channels)
+        frames_by_channels = interleaved.astype(np.float32)
+        frames_by_channels *= np.float32(1.0 / 32768.0)
         return frames_by_channels
 
     def _match_output_channels(self, array: np.ndarray) -> np.ndarray:
@@ -292,11 +257,11 @@ class AudioTrack:
         pad = np.repeat(array[:, -1:], channels - current_channels, axis=1)
         return np.concatenate([array, pad], axis=1)
 
-    def _get_resampled_frames(self, frame: AudioFrame | None) -> Iterator[np.ndarray]:
-        if frame is None:
+    def _get_resampled_frames(self, chunk: bytearray | None) -> Iterator[np.ndarray]:
+        if chunk is None:
             resampled = self._resampler.resample_chunk(self._flush_chunk, last=True)
         else:
-            source = self._to_frames_by_channels(frame)
+            source = self._to_frames_by_channels(chunk)
             resampled = self._resampler.resample_chunk(source, last=False)
 
         if resampled.size <= 0:

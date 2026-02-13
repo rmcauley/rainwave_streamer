@@ -5,5 +5,5 @@ This is a temporary repository to hold Rainwave's new audio streamer until it ca
 Debian requirements:
 
 ```sh
-apt install libshout3 libshout3-dev libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev libswresample-dev libswscale-dev libopus-dev libmp3lame-dev
+apt install ffmpeg libshout3-dev libmad0-dev libsoxr-dev
 ```
