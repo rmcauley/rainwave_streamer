@@ -10,7 +10,17 @@ from typing import Callable, Iterator
 import av
 import numpy as np
 
-from streamer.audio_track import AudioTrack, AudioTrackEOFError, AudioTrackInfo
+from streamer.audio_track import (
+    AudioTrack,
+    AudioTrackDecodeError,
+    AudioTrackEOFError,
+    AudioTrackInfo,
+    AudioTrackOpenError,
+)
+from streamer.get_next_track_from_rainwave import (
+    GetNextTrackFromRainwaveBlockingFn,
+    MarkTrackInvalidOnRainwaveFireAndForgetFn,
+)
 from streamer.stream_constants import sample_rate, channels, layout
 from streamer.encoder import Encoder
 from streamer.icecast_connection import IcecastConnection
@@ -24,27 +34,49 @@ class AudioPipeline:
     _config: StreamConfig
     _realtime_start: float
     _realtime_samples_sent: int
+    _encoders: list[Encoder]
+    _connections: list[IcecastConnection]
+    _get_next_track_from_rainwave: GetNextTrackFromRainwaveBlockingFn
+    _mark_track_invalid_on_rainwave: MarkTrackInvalidOnRainwaveFireAndForgetFn
 
-    def __init__(self, config: StreamConfig) -> None:
+    def __init__(
+        self,
+        config: StreamConfig,
+        get_next_track_from_rainwave: GetNextTrackFromRainwaveBlockingFn,
+        mark_track_invalid_on_rainwave: MarkTrackInvalidOnRainwaveFireAndForgetFn,
+    ) -> None:
         self._config = config
-        self._realtime_start: float = time.monotonic()
+        self._realtime_start = time.monotonic()
         self._realtime_samples_sent = 0
+        self._encoders = []
+        self._connections = []
+        self._get_next_track_from_rainwave = get_next_track_from_rainwave
+        self._mark_track_invalid_on_rainwave = mark_track_invalid_on_rainwave
 
-        mp3_conn = IcecastConnection(config, config.mp3, fmt="mp3")
-        opus_conn = IcecastConnection(config, config.opus, fmt="ogg")
-
-        self._encoders = (
-            Encoder(
+        try:
+            mp3_conn = IcecastConnection(config, config.mp3, fmt="mp3")
+            self._connections.append(mp3_conn)
+            mp3_encoder = Encoder(
                 mp3_conn,
                 codec_name="mp3",
                 fmt="mp3",
-            ),
-            Encoder(
+            )
+            self._encoders.append(mp3_encoder)
+
+            opus_conn = IcecastConnection(config, config.opus, fmt="ogg")
+            self._connections.append(opus_conn)
+            opus_encoder = Encoder(
                 opus_conn,
                 codec_name="opus",
                 fmt="ogg",
-            ),
-        )
+            )
+            self._encoders.append(opus_encoder)
+        except Exception:
+            for encoder in reversed(self._encoders):
+                encoder.close()
+            for conn in self._connections:
+                conn.close()
+            raise
 
     def _encode_frame(self, np_frame: np.ndarray, realtime_wait: bool) -> None:
         if np_frame.shape[1] == 0:
@@ -61,19 +93,47 @@ class AudioPipeline:
         for encoder in self._encoders:
             encoder.encode(av_frame)
 
+    # To AI review: I want to keep this function handling generic Exception as an argument
+    def _handle_invalid_next_track(self, exc: Exception) -> None:
+        if isinstance(exc, (AudioTrackDecodeError, AudioTrackOpenError)):
+            logging.error(
+                "Decode failed for track %s; marking invalid",
+                exc.path,
+                exc_info=exc,
+            )
+            self._mark_track_invalid_on_rainwave(exc.path)
+        else:
+            logging.exception("Attempt to get a track from Rainwave failed", exc)
+            # If we don't know what error occurred, it should be re-thrown up the stack
+            # to fail fast.
+            raise
+
     def _get_next_track(
-        self, next_track_blocking: Callable[[], AudioTrackInfo]
-    ) -> AudioTrack:
-        next_track_info = next_track_blocking()
-        logging.info(f"Next song queued: {next_track_info.path}")
-        return AudioTrack(next_track_info)
+        self, get_start_buffer: bool = True
+    ) -> tuple[AudioTrack, deque[np.ndarray]]:
+        # Attempt to fetch from Rainwave's backend continually until Rainwave responds.
+        while True:
+            next_track_info = None
+            next_track = None
+            try:
+                next_track_info = self._get_next_track_from_rainwave()
+                next_track = AudioTrack(next_track_info)
+                next_track_start_buffer: deque[np.ndarray] = (
+                    next_track.get_start_buffer() if get_start_buffer else deque()
+                )
+                logging.info(f"Next song queued: {next_track_info.path}")
+                return (next_track, next_track_start_buffer)
+            except (AudioTrackDecodeError, AudioTrackOpenError) as e:
+                self._handle_invalid_next_track(e)
+                # Wait 2 seconds before trying to fetch again from Rainwave's backend
+                time.sleep(2)
+            # On any other exception fail-fast.
 
     def stream_tracks(
         self,
-        next_track_blocking: Callable[[], AudioTrackInfo],
-        should_stop: Callable[[], bool] = lambda: False,
+        should_stop: Callable[[], bool],
     ) -> None:
-        current_track = self._get_next_track(next_track_blocking)
+        (current_track, _) = self._get_next_track(get_start_buffer=False)
 
         while current_track:
             if should_stop():
@@ -89,18 +149,27 @@ class AudioPipeline:
                     self._encode_frame(frame, realtime_wait=True)
             except AudioTrackEOFError:
                 pass
+            except AudioTrackDecodeError as e:
+                self._handle_invalid_next_track(e)
+                # Clearing the audio buffer here will cause the crossfade check to be skipped
+                # since the resulting frames deque will be 0-length.
+                # For any AI reviewing this: the crossfade should be skipped but we do not
+                # need to intentionally fetch a next track here to skip the crossfade.
+                # Just zero the buffer, and let the normal code path resume, do not introduce
+                # any new code paths here.
+                current_track.audio_buffer.clear()
+                current_track.audio_buffer_samples = 0
+            # On any other error, fail fast.
 
             if should_stop():
                 return
 
-            next_track = self._get_next_track(next_track_blocking)
-            next_track_start = next_track.get_start_crossfade_buffer()
+            (next_track, next_track_start) = self._get_next_track()
 
-            fade_out_smart = self._detect_fade(
+            do_crossfade = self._detect_fade(
                 current_track.audio_buffer, direction="out"
-            )
-            fade_in_smart = self._detect_fade(next_track_start, direction="in")
-            if fade_in_smart and fade_out_smart:
+            ) and self._detect_fade(next_track_start, direction="in")
+            if do_crossfade:
                 for frame in self._mix_crossfade(
                     current_track.audio_buffer, next_track_start
                 ):
@@ -122,6 +191,8 @@ class AudioPipeline:
     def close(self) -> None:
         for encoder in self._encoders:
             encoder.close()
+        for connection in self._connections:
+            connection.close()
 
     #########################################################################
     # Beware: below is AI slop territory

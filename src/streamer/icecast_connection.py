@@ -35,7 +35,8 @@ class IcecastConnection:
         self._fmt = fmt
         self.mount_name = mount.mount
         self._conn_lock = Lock()
-        self._conn = self._open_connection()
+        self._closed = False
+        self._conn: shout.Shout | None = self._open_connection()
 
     def _open_connection(self) -> shout.Shout:
         mount = self._mount
@@ -92,9 +93,20 @@ class IcecastConnection:
 
     def reconnect(self) -> None:
         new_conn = self._open_connection()
+        old_conn = None
+        close_new_conn = False
         with self._conn_lock:
-            old_conn = self._conn
-            self._conn = new_conn
+            if self._closed:
+                close_new_conn = True
+            else:
+                old_conn = self._conn
+                self._conn = new_conn
+        if close_new_conn:
+            try:
+                new_conn.close()
+            except Exception:
+                pass
+            return
         if old_conn is not None:
             try:
                 old_conn.close()
@@ -103,6 +115,9 @@ class IcecastConnection:
 
     def close(self) -> None:
         with self._conn_lock:
+            if self._closed:
+                return
+            self._closed = True
             conn = self._conn
             self._conn = None
         if conn is None:

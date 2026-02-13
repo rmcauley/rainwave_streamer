@@ -22,13 +22,18 @@ class Encoder:
         fmt: Literal["mp3", "ogg"],
     ) -> None:
         self._sender = ThreadedSender(conn)
-        # PyAV writes to our ThreadedSender which looks like a file
-        self._container = av.open(self._sender, mode="w", format=fmt)
+        try:
+            # PyAV writes to our ThreadedSender which looks like a file
+            self._container = av.open(self._sender, mode="w", format=fmt)
 
-        if codec_name == "mp3":
-            self._stream = self.get_mp3_stream(self._container)
-        else:
-            self._stream = self.get_opus_stream(self._container)
+            if codec_name == "mp3":
+                self._stream = self.get_mp3_stream(self._container)
+            else:
+                self._stream = self.get_opus_stream(self._container)
+        except Exception:
+            # Roll back the sender thread/connection if encoder initialization fails.
+            self._sender.close()
+            raise
 
     def get_mp3_stream(self, container: OutputContainer) -> AudioStream:
         stream = container.add_stream(  # pyright: ignore[reportUnknownMemberType]

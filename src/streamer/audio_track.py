@@ -33,6 +33,20 @@ class AudioTrackEOFError(Exception):
     pass
 
 
+class AudioTrackOpenError(Exception):
+    path: str
+
+    def __init__(self, path):
+        self.path = path
+
+
+class AudioTrackDecodeError(Exception):
+    path: str
+
+    def __init__(self, path):
+        self.path = path
+
+
 @dataclass(frozen=True)
 class AudioTrackInfo:
     path: str
@@ -87,11 +101,11 @@ class AudioTrack:
             self._decoder = self._container.decode(self._stream)
         except Exception as e:
             logging.error(f"Failed to open track {track_info.path}: {e}")
-            raise
+            raise AudioTrackOpenError(self.path) from e
 
-    def get_start_crossfade_buffer(self) -> deque[np.ndarray]:
+    def get_start_buffer(self) -> deque[np.ndarray]:
         # Get the start-of-song buffer, trimming silence, up to 5 seconds.
-        start_buffer = deque()
+        start_buffer: deque[np.ndarray] = deque()
         start_buffer_samples = 0
         trimming = True
         try:
@@ -124,7 +138,7 @@ class AudioTrack:
                 e,
             )
             self._container.close()
-            raise
+            raise AudioTrackDecodeError(self.path) from e
 
         return start_buffer
 
@@ -181,7 +195,7 @@ class AudioTrack:
             logging.debug(f"Finished decoding {self.path}")
         except Exception as e:
             logging.error(f"Error decoding {self.path}: {e}")
-            raise
+            raise AudioTrackDecodeError(self.path) from e
         finally:
             self._container.close()
 

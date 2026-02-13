@@ -30,3 +30,4 @@ dev = [
 [tool.mypy]
 files = "src/**/*.py"
 mypy_path = ["src", "src/typestubs"]
+explicit_package_bases = true

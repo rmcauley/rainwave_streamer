@@ -67,7 +67,8 @@ class ThreadedSender:
                 if self._stop_event.wait(timeout=retry_delay_seconds):
                     return
                 try:
-                    self._conn.reconnect()
+                    if not self._reconnect_with_shutdown_support():
+                        return
                     logging.info(
                         "Reconnected to Icecast mount %s.", self._conn.mount_name
                     )
@@ -77,6 +78,38 @@ class ThreadedSender:
                         self._conn.mount_name,
                         reconnect_error,
                     )
+
+    def _reconnect_with_shutdown_support(self) -> bool:
+        reconnect_done = Event()
+        reconnect_error: list[Exception] = []
+
+        def reconnect_target() -> None:
+            try:
+                self._conn.reconnect()
+            except Exception as e:
+                reconnect_error.append(e)
+            finally:
+                reconnect_done.set()
+
+        reconnect_thread = Thread(
+            target=reconnect_target,
+            daemon=True,
+            name=f"Reconnect-{self._conn.mount_name}",
+        )
+        reconnect_thread.start()
+
+        while not reconnect_done.wait(timeout=0.25):
+            if self._stop_event.is_set():
+                return False
+
+        if reconnect_error:
+            error = reconnect_error[0]
+            if isinstance(error, IcecastConnectionError):
+                raise error
+            raise IcecastConnectionError(
+                f"Unexpected reconnect error for {self._conn.mount_name}: {error}"
+            ) from error
+        return True
 
     def write(self, data: bytes) -> int:
         if not data:
