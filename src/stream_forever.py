@@ -5,8 +5,12 @@
 import asyncio
 import logging
 import signal
+import time
+import tracemalloc
 from concurrent.futures import Future
 from threading import Event, Thread
+
+import psutil
 
 from streamer.get_next_track_from_rainwave import (
     get_next_track_from_rainwave,
@@ -15,6 +19,10 @@ from streamer.get_next_track_from_rainwave import (
 from streamer.audio_pipeline import AudioPipeline, AudioPipelineGracefulShutdownError
 from streamer.audio_track import AudioTrackInfo
 from streamer.stream_config import StreamConfig
+
+memory_log_interval_seconds = 30.0
+bytes_per_mebibyte = 1024 * 1024
+tracemalloc_frames = 25
 
 
 async def stream_forever(config: StreamConfig) -> None:
@@ -25,6 +33,34 @@ async def stream_forever(config: StreamConfig) -> None:
     pipeline: AudioPipeline | None = None
     worker: Thread | None = None
     installed_signal_handlers: list[signal.Signals] = []
+    if not tracemalloc.is_tracing():
+        tracemalloc.start(tracemalloc_frames)
+    process = psutil.Process()
+    next_memory_log_at = 0.0
+
+    def log_memory_usage(force: bool = False) -> None:
+        nonlocal next_memory_log_at
+
+        now = time.monotonic()
+        if not force and now < next_memory_log_at:
+            return
+        next_memory_log_at = now + memory_log_interval_seconds
+
+        try:
+            rss_bytes = process.memory_info().rss
+            thread_count = process.num_threads()
+            traced_current, traced_peak = tracemalloc.get_traced_memory()
+        except Exception as e:
+            logging.debug("Unable to collect memory usage stats: %s", e)
+            return
+
+        logging.info(
+            "Memory usage: rss=%.1fMiB python_current=%.1fMiB python_peak=%.1fMiB threads=%d",
+            rss_bytes / bytes_per_mebibyte,
+            traced_current / bytes_per_mebibyte,
+            traced_peak / bytes_per_mebibyte,
+            thread_count,
+        )
 
     def should_stop_workers() -> bool:
         return shutdown_requested.is_set()
@@ -104,6 +140,7 @@ async def stream_forever(config: StreamConfig) -> None:
         worker = Thread(target=worker_target, daemon=True, name="AudioPipelineWorker")
         worker.start()
         while worker.is_alive():
+            log_memory_usage()
             if worker_error:
                 raise worker_error[0]
             await asyncio.sleep(0.2)
@@ -113,6 +150,7 @@ async def stream_forever(config: StreamConfig) -> None:
         shutdown_requested.set()
         raise
     finally:
+        log_memory_usage(force=True)
         shutting_down.set()
         shutdown_requested.set()
 
