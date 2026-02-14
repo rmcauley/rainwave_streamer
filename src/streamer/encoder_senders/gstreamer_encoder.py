@@ -140,6 +140,13 @@ class GstreamerEncoderSender(EncoderSender):
             )
         return element
 
+    def _disable_tag_metadata(self, element: Any) -> None:
+        if not isinstance(element, Gst.TagSetter):
+            return
+        # Keep only local (empty) tags so upstream metadata is never forwarded.
+        element.reset_tags()
+        element.set_tag_merge_mode(Gst.TagMergeMode.KEEP_ALL)
+
     def _build_pipeline(self, format: SupportedFormats) -> Any:
         pipeline = Gst.Pipeline.new(f"gstreamer-encoder-{format}")
         if pipeline is None:  # pyright: ignore[reportUnnecessaryComparison]
@@ -199,6 +206,9 @@ class GstreamerEncoderSender(EncoderSender):
 
         encoder = self._make_gst_element("opusenc", "encoder")
         muxer = self._make_gst_element("oggmux", "mux")
+        self._disable_tag_metadata(encoder)
+        self._disable_tag_metadata(muxer)
+        muxer.set_property("skeleton", False)
         encoder.set_property("bitrate-type", "vbr")
         encoder.set_property("bitrate", opus_bitrate_approx * 1000)
         encoder.set_property("audio-type", "generic")
