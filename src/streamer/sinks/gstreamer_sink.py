@@ -52,6 +52,13 @@ class GstreamerSink(AudioSink):
             )
         return element
 
+    def _disable_tag_metadata(self, element: Any) -> None:
+        if not isinstance(element, Gst.TagSetter):
+            return
+        # Keep only local (empty) tags so upstream metadata is never forwarded.
+        element.reset_tags()
+        element.set_tag_merge_mode(Gst.TagMergeMode.KEEP_ALL)
+
     def _format_caps(self) -> str:
         if self._format == "mp3":
             return "audio/mpeg,mpegversion=(int)1,layer=(int)3"
@@ -97,8 +104,8 @@ class GstreamerSink(AudioSink):
         shout2send.set_property("public", False)
         shout2send.set_property("protocol", "http")
         shout2send.set_property("sync", False)
-        if self._format == "mp3":
-            shout2send.set_property("send-title-info", False)
+        shout2send.set_property("send-title-info", False)
+        self._disable_tag_metadata(shout2send)
 
         pipeline.add(appsrc)
         pipeline.add(queue)
