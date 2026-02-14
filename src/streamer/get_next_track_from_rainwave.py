@@ -16,7 +16,7 @@ async def get_next_track_from_rainwave(sid: int) -> TrackInfo:
     try:
         timeout = 2 if await cache.cache_get_station(sid, "backend_ok") else 120
         conn = HTTPConnection(
-            "localhost", config.song_change_api_port + int(sid), timeout=timeout
+            "localhost", config.backend_port + int(sid), timeout=timeout
         )
         conn.request("GET", "/advance/%s" % sid)
         result = conn.getresponse()
