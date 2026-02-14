@@ -68,7 +68,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
         if args.perftest
         else StreamConfig(
             host=relay_config["ip_address"],
-            port=relay_config["port"],
+            port=8000,
             password=relay_config["source_password"],
             stream_filename=station_config["stream_filename"],
             name=station_config["name"],
