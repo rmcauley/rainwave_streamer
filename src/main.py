@@ -21,11 +21,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sid", required=True, type=int, help="Rainwave station ID")
     parser.add_argument(
         "--perftest",
-        required=False,
-        type=bool,
+        action="store_true",
         help="Run a performance test",
-        default=False,
-        const=True,
     )
     return parser.parse_args(argv)
 
