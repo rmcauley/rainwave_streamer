@@ -35,16 +35,6 @@ class AudioPipelineGracefulShutdownError(Exception):
 
 
 class AudioPipeline:
-    _config: StreamConfig
-    _realtime_start: float
-    _realtime_samples_sent: int
-    _encoders: list[EncoderSender]
-    _get_next_track_from_rainwave: GetNextTrackFromRainwaveBlockingFn
-    _mark_track_invalid_on_rainwave: MarkTrackInvalidOnRainwaveFireAndForgetFn
-    _should_stop: ShouldStopFn
-    _close_lock: Lock
-    _closed: bool
-
     def __init__(
         self,
         config: StreamConfig,
@@ -54,12 +44,13 @@ class AudioPipeline:
         get_next_track_from_rainwave: GetNextTrackFromRainwaveBlockingFn,
         mark_track_invalid_on_rainwave: MarkTrackInvalidOnRainwaveFireAndForgetFn,
         should_stop: ShouldStopFn,
-        use_realtime_wait: bool = True,
+        use_realtime_wait: bool,
+        show_performance: bool,
     ) -> None:
         self._config = config
         self._realtime_start = time.monotonic()
         self._realtime_samples_sent = 0
-        self._encoders = []
+        self._encoders: list[EncoderSender] = []
         self._get_next_track_from_rainwave = get_next_track_from_rainwave
         self._mark_track_invalid_on_rainwave = mark_track_invalid_on_rainwave
         self._should_stop = should_stop
@@ -67,6 +58,7 @@ class AudioPipeline:
         self._closed = False
         self._audio_track = audio_track
         self._use_realtime_wait = use_realtime_wait
+        self._show_performance = show_performance
 
         try:
             self._encoders.append(
@@ -134,6 +126,8 @@ class AudioPipeline:
         self,
     ) -> None:
         current_track: TrackDecoder | None = None
+        track_change_counter = 0
+        perf_timer = time.monotonic()
         try:
             (current_track, _) = self._get_next_track(get_start_buffer=False)
 
@@ -173,10 +167,20 @@ class AudioPipeline:
                 finished_track = current_track
                 current_track = next_track
                 finished_track.close()
+
+                if self._show_performance and track_change_counter % 28 == 0:
+                    print("Perf: %.2f" % (time.monotonic() - perf_timer))
+                    # I only need to see 1 sample for perf testing of the process.
+                    # Anything after the first will just be noise.
+                    self._show_performance = False
+
+                track_change_counter += 1
+
         finally:
             if current_track is not None:
                 current_track.close()
             self.close()
+            print(track_change_counter)
 
     def close(self) -> None:
         with self._close_lock:

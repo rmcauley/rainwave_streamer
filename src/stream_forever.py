@@ -31,7 +31,7 @@ async def stream_forever(
     encoder: EncoderSenderConstructor,
     connection: AudioSinkConstructor,
     use_realtime_wait: bool,
-    show_memory_usage: bool,
+    show_performance: bool,
 ) -> None:
     loop = asyncio.get_running_loop()
     shutdown_requested = Event()
@@ -40,7 +40,7 @@ async def stream_forever(
     worker: Thread | None = None
     process: psutil.Process | None = None
 
-    if show_memory_usage and not tracemalloc.is_tracing():
+    if show_performance and not tracemalloc.is_tracing():
         tracemalloc.start(tracemalloc_frames)
         process = psutil.Process()
         next_memory_log_at = 0.0
@@ -64,12 +64,14 @@ async def stream_forever(
             logging.debug("Unable to collect memory usage stats: %s", e)
             return
 
-        logging.info(
-            "Memory usage: rss=%.1fMiB python_current=%.1fMiB python_peak=%.1fMiB threads=%d",
-            rss_bytes / bytes_per_mebibyte,
-            traced_current / bytes_per_mebibyte,
-            traced_peak / bytes_per_mebibyte,
-            thread_count,
+        print(
+            "Memory usage: rss=%.1fMiB python_current=%.1fMiB python_peak=%.1fMiB threads=%d"
+            % (
+                rss_bytes / bytes_per_mebibyte,
+                traced_current / bytes_per_mebibyte,
+                traced_peak / bytes_per_mebibyte,
+                thread_count,
+            )
         )
 
     def should_stop_workers() -> bool:
@@ -127,12 +129,13 @@ async def stream_forever(
             server_connector=connection,
             should_stop=should_stop_workers,
             use_realtime_wait=use_realtime_wait,
+            show_performance=show_performance,
         )
         worker = Thread(target=worker_target, daemon=True, name="AudioPipelineWorker")
         worker.start()
 
         while worker.is_alive():
-            if show_memory_usage:
+            if show_performance:
                 log_memory_usage()
             if worker_error:
                 raise worker_error[0]

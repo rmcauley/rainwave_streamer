@@ -41,13 +41,14 @@ def _build_null_stream_config() -> StreamConfig:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
+
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.ERROR if args.perftest else logging.DEBUG,
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
-    args = _parse_args(argv)
     sid: int | None = args.sid
     if sid is None:
         raise Exception("sid argument must be provided")
@@ -79,7 +80,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 connection=NullSink if args.perftest else IcecastSink,
                 decoder=GstreamerTrackDecoder,
                 encoder=SubprocessEncoderSender,
-                show_memory_usage=args.perftest,
+                show_performance=args.perftest,
                 use_realtime_wait=False if args.perftest else True,
             )
         )
