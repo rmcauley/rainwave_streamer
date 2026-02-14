@@ -5,7 +5,7 @@ import emcache
 import config
 from typing import Any
 
-client: emcache.Client | None
+client: emcache.Client | None = None
 
 in_memory: dict[bytes, Any] = {}
 

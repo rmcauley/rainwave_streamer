@@ -79,15 +79,13 @@ async def main(argv: Sequence[str] | None = None) -> int:
         )
     )
     try:
-        asyncio.run(
-            stream_forever(
-                config=stream_config,
-                connection=NullSink if args.perftest else GstreamerSink,
-                decoder=GstreamerTrackDecoder,
-                encoder=GstreamerEncoderSender,
-                show_performance=args.perftest,
-                use_realtime_wait=False if args.perftest else True,
-            )
+        await stream_forever(
+            config=stream_config,
+            connection=NullSink if args.perftest else GstreamerSink,
+            decoder=GstreamerTrackDecoder,
+            encoder=GstreamerEncoderSender,
+            show_performance=args.perftest,
+            use_realtime_wait=False if args.perftest else True,
         )
     except KeyboardInterrupt:
         pass
@@ -98,4 +96,4 @@ async def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(asyncio.run(main()))
