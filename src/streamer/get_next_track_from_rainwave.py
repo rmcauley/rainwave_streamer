@@ -1,3 +1,4 @@
+import logging
 from http.client import HTTPConnection
 import socket
 
@@ -14,10 +15,7 @@ async def get_next_track_from_rainwave(sid: int) -> TrackInfo:
     conn: HTTPConnection | None = None
     track_info: TrackInfo | None = None
     try:
-        timeout = 2 if await cache.cache_get_station(sid, "backend_ok") else 120
-        conn = HTTPConnection(
-            "localhost", config.backend_port + int(sid), timeout=timeout
-        )
+        conn = HTTPConnection("localhost", config.backend_port + int(sid), timeout=2)
         conn.request("GET", "/advance/%s" % sid)
         result = conn.getresponse()
         if result.status == 200:
@@ -33,17 +31,22 @@ async def get_next_track_from_rainwave(sid: int) -> TrackInfo:
             if separator == "" or not path:
                 raise Exception("Missing track path from backend response!")
 
-            replay_gain_marker = 'replay_gain="'
-            replay_gain_start = metadata.find(replay_gain_marker)
-            if replay_gain_start < 0:
-                raise Exception("Missing replay_gain from backend response!")
-            replay_gain_start += len(replay_gain_marker)
-            replay_gain_end = metadata.find('"', replay_gain_start)
-            if replay_gain_end < 0:
-                raise Exception("Malformed replay_gain in backend response!")
+            # Safe default till bugs are gone
+            gain_db = -10.0
+            try:
+                replay_gain_marker = 'replay_gain="'
+                replay_gain_start = metadata.find(replay_gain_marker)
+                if replay_gain_start < 0:
+                    raise Exception("Missing replay_gain from backend response!")
+                replay_gain_start += len(replay_gain_marker)
+                replay_gain_end = metadata.find('"', replay_gain_start)
+                if replay_gain_end < 0:
+                    raise Exception("Malformed replay_gain in backend response!")
 
-            replay_gain_str = metadata[replay_gain_start:replay_gain_end]
-            gain_db = float(replay_gain_str.removesuffix(" dB"))
+                replay_gain_str = metadata[replay_gain_start:replay_gain_end]
+                gain_db = float(replay_gain_str.removesuffix(" dB"))
+            except Exception as e:
+                logging.error("Could not read replay_gain information.", exc_info=e)
             track_info = TrackInfo(path=path, gain_db=gain_db)
         else:
             raise Exception("HTTP Error %s trying to reach backend!" % result.status)
