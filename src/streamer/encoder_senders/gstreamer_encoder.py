@@ -142,6 +142,10 @@ class GstreamerEncoderSender(EncoderSender):
 
     def _build_pipeline(self, format: SupportedFormats) -> Any:
         pipeline = Gst.Pipeline.new(f"gstreamer-encoder-{format}")
+        if pipeline is None:  # pyright: ignore[reportUnnecessaryComparison]
+            raise EncoderSenderEncodeError(
+                "Failed to create GStreamer encoder pipeline."
+            )
 
         appsrc = self._make_gst_element("appsrc", "src")
         audioconvert = self._make_gst_element("audioconvert", "convert")

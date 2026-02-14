@@ -59,6 +59,8 @@ class GstreamerSink(AudioSink):
 
     def _build_pipeline(self) -> Any:
         pipeline = Gst.Pipeline.new(f"gstreamer-sink-{self._format}")
+        if pipeline is None:  # pyright: ignore[reportUnnecessaryComparison]
+            raise AudioSinkError("Failed to create GStreamer sink pipeline.")
 
         appsrc = self._make_gst_element("appsrc", "src")
         queue = self._make_gst_element("queue", "queue")

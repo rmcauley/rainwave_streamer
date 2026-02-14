@@ -117,9 +117,13 @@ class AudioPipeline:
             try:
                 next_track_info = self._get_next_track_from_rainwave()
                 next_track = self._audio_track(next_track_info)
-                next_track_start_buffer: deque[TrackFrame] = (
-                    next_track.get_start_buffer() if get_start_buffer else deque()
-                )
+                try:
+                    next_track_start_buffer: deque[TrackFrame] = (
+                        next_track.get_start_buffer() if get_start_buffer else deque()
+                    )
+                except Exception:
+                    next_track.close()
+                    raise
                 logging.info(f"Next song queued: {next_track_info.path}")
                 return (next_track, next_track_start_buffer)
             except (TrackDecodeError, TrackOpenError) as e:
