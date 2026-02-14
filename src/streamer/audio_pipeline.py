@@ -54,6 +54,7 @@ class AudioPipeline:
         get_next_track_from_rainwave: GetNextTrackFromRainwaveBlockingFn,
         mark_track_invalid_on_rainwave: MarkTrackInvalidOnRainwaveFireAndForgetFn,
         should_stop: ShouldStopFn,
+        use_realtime_wait: bool = True,
     ) -> None:
         self._config = config
         self._realtime_start = time.monotonic()
@@ -65,6 +66,7 @@ class AudioPipeline:
         self._close_lock = Lock()
         self._closed = False
         self._audio_track = audio_track
+        self._use_realtime_wait = use_realtime_wait
 
         try:
             self._encoders.append(
@@ -83,7 +85,7 @@ class AudioPipeline:
 
         if np_frame.shape[1] == 0:
             return
-        if realtime_wait:
+        if self._use_realtime_wait and realtime_wait:
             self._realtime_wait(np_frame.shape[1])
 
         for encoder in self._encoders:

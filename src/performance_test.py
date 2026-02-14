@@ -4,82 +4,40 @@ import sys
 import time
 import tracemalloc
 from concurrent.futures import Future
-from threading import Event, Lock, Thread
-from typing import Literal
+from threading import Event, Thread
 
 import psutil
 
-import streamer.audio_pipeline as audio_pipeline_module
 from streamer.audio_pipeline import AudioPipeline, AudioPipelineGracefulShutdownError
-from streamer.decoders.gstreamer_audio_track import AudioTrackInfo
+from streamer.connectors.null_sink_connection import NullSinkConnection
+from streamer.decoders.audio_track import AudioTrackInfo
+from streamer.decoders.gstreamer_audio_track import GstreamerAudioTrack
+from streamer.encoder_senders.subprocess_encoder import SubprocessEncoderSender
 from streamer.get_next_track_from_rainwave import (
     get_next_track_from_rainwave,
     mark_track_invalid_on_rainwave,
 )
 from streamer.stream_config import StreamConfig
-from streamer.stream_constants import mp3_bitrate_approx, opus_bitrate_approx
-from streamer.stream_mount import StreamMount
+
+# Swap these classes for performance or leak experiments.
+DECODER_CLASS = GstreamerAudioTrack
+ENCODER_SENDER_CLASS = SubprocessEncoderSender
 
 memory_log_interval_seconds = 30.0
 bytes_per_mebibyte = 1024 * 1024
 tracemalloc_frames = 25
 
 
-class NullSinkConnection:
-    """
-    Drop-in replacement for IcecastConnection that discards encoded bytes.
-    """
-
-    def __init__(
-        self,
-        config: StreamConfig,
-        mount: StreamMount,
-        *,
-        fmt: Literal["mp3", "ogg"],
-    ) -> None:
-        del config
-        del fmt
-        self.mount_name = mount.mount
-        self._closed = False
-        self._bytes_sent = 0
-        self._lock = Lock()
-
-    def send(self, data: bytes) -> None:
-        if not data:
-            return
-        with self._lock:
-            if self._closed:
-                return
-            self._bytes_sent += len(data)
-
-    def close(self) -> None:
-        with self._lock:
-            self._closed = True
-
-
 def _build_null_stream_config() -> StreamConfig:
     return StreamConfig(
+        description="Local sink test; no Icecast connection.",
+        genre="Test",
         host="127.0.0.1",
-        port=8000,
+        name="Null Sink Memory Leak Test",
         password="unused",
-        mp3=StreamMount(
-            mount="null_sink.mp3",
-            bitrate=mp3_bitrate_approx,
-            name="Null Sink Memory Leak Test",
-            description="Local sink test; no Icecast connection.",
-            genre="Test",
-            url="http://localhost/null_sink.mp3",
-            public=0,
-        ),
-        opus=StreamMount(
-            mount="null_sink.ogg",
-            bitrate=opus_bitrate_approx,
-            name="Null Sink Memory Leak Test",
-            description="Local sink test; no Icecast connection.",
-            genre="Test",
-            url="http://localhost/null_sink.ogg",
-            public=0,
-        ),
+        port=8000,
+        stream_filename="null_sink",
+        url="http://localhost/null_sink",
     )
 
 
@@ -128,8 +86,6 @@ async def stream_forever_to_null_sink() -> None:
         future = asyncio.run_coroutine_threadsafe(get_next_track_from_rainwave(), loop)
         try:
             track_info = future.result(timeout=2.0)
-            if track_info is None:
-                raise RuntimeError("No track info returned by get_next_track.")
             return track_info
         except Exception as e:
             future.cancel()
@@ -166,15 +122,16 @@ async def stream_forever_to_null_sink() -> None:
             worker_error.append(e)
             shutdown_requested.set()
 
-    original_connection_class = audio_pipeline_module.IcecastConnection
-    audio_pipeline_module.IcecastConnection = NullSinkConnection  # type: ignore[assignment]
-
     try:
         pipeline = AudioPipeline(
-            _build_null_stream_config(),
-            next_track_blocking,
-            mark_track_invalid_fire_and_forget,
-            should_stop_workers,
+            audio_track=DECODER_CLASS,
+            config=_build_null_stream_config(),
+            encoder_sender=ENCODER_SENDER_CLASS,
+            get_next_track_from_rainwave=next_track_blocking,
+            mark_track_invalid_on_rainwave=mark_track_invalid_fire_and_forget,
+            server_connector=NullSinkConnection,
+            should_stop=should_stop_workers,
+            use_realtime_wait=False,
         )
         worker = Thread(target=worker_target, daemon=True, name="AudioPipelineWorker")
         worker.start()
@@ -193,7 +150,6 @@ async def stream_forever_to_null_sink() -> None:
     finally:
         log_memory_usage(force=True)
         shutdown_requested.set()
-        audio_pipeline_module.IcecastConnection = original_connection_class
 
         worker_stopped = worker is None
         if worker is not None:
