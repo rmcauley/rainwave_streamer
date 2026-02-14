@@ -28,7 +28,7 @@ async def get_next_track_from_rainwave(sid: int) -> TrackInfo:
 
             logging.debug(f"From Rainwave:\n{raw_track}")
 
-            _, _, metadata_and_path = raw_track.split("\n")[0].partition("annotate:")
+            _, _, metadata_and_path = raw_track.partition("annotate:")
             metadata, separator, path = metadata_and_path.rpartition(":")
             if separator == "" or not path:
                 raise Exception("Missing track path from backend response!")
