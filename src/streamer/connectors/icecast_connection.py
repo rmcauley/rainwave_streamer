@@ -1,39 +1,19 @@
-#########################################################################
-# This file was AI generated with some human supervision.
-#########################################################################
-
 import logging
 from threading import Event, Lock, Thread
-from typing import Literal
 
 import shout
 
-from streamer.stream_constants import (
-    sample_rate,
-    channels,
-    opus_bitrate_approx,
-    mp3_bitrate_approx,
+from streamer.connectors.connection import (
+    AudioServerConnection,
+    AudioServerConnectionError,
 )
-from streamer.stream_config import StreamConfig
-from streamer.stream_mount import StreamMount
+from streamer.stream_config import StreamConfig, SupportedFormats, sample_rate, channels
 
 
-class IcecastConnectionError(Exception):
-    pass
+class IcecastConnection(AudioServerConnection):
+    def __init__(self, config: StreamConfig, format: SupportedFormats) -> None:
+        super().__init__(config, format)
 
-
-class IcecastConnection:
-    def __init__(
-        self,
-        config: StreamConfig,
-        mount: StreamMount,
-        *,
-        fmt: Literal["mp3", "ogg"],
-    ) -> None:
-        self._config = config
-        self._mount = mount
-        self._fmt = fmt
-        self.mount_name = mount.mount
         self._conn_lock = Lock()
         self._reconnect_lock = Lock()
         self._closed = False
@@ -44,37 +24,33 @@ class IcecastConnection:
         self._conn: shout.Shout | None = self._open_connection()
 
     def _open_connection(self) -> shout.Shout:
-        mount = self._mount
         config = self._config
-        fmt = self._fmt
 
         conn = shout.Shout()
         conn.host = config.host
         conn.port = config.port
         conn.user = "source"
         conn.password = config.password
-        conn.mount = mount.mount
-        conn.format = fmt
+        conn.mount = self.mount_path
+        conn.format = self._format
         conn.protocol = "http"
-        conn.public = mount.public
-        conn.name = mount.name
-        conn.description = mount.description
-        conn.genre = mount.genre
-        conn.url = mount.url
+        conn.public = 0
+        conn.name = self._config.name
+        conn.description = self._config.description
+        conn.genre = self._config.genre
+        conn.url = self._config.url
         conn.audio_info = {
-            shout.SHOUT_AI_BITRATE: (
-                str(opus_bitrate_approx) if fmt == "ogg" else str(mp3_bitrate_approx)
-            ),
+            shout.SHOUT_AI_BITRATE: "128",
             shout.SHOUT_AI_SAMPLERATE: str(sample_rate),
             shout.SHOUT_AI_CHANNELS: str(channels),
         }
 
-        logging.info(f"Connecting to Icecast mount {mount.mount}...")
+        logging.info(f"Connecting to Icecast mount {self.mount_path}...")
         try:
             conn.open()
         except Exception as e:
-            raise IcecastConnectionError(
-                f"Failed opening Icecast connection for {mount.mount}: {e}"
+            raise AudioServerConnectionError(
+                f"Failed opening Icecast connection for {self.mount_path}: {e}"
             ) from e
         return conn
 
@@ -86,8 +62,8 @@ class IcecastConnection:
             with self._conn_lock:
                 conn = self._conn
             if conn is None:
-                raise IcecastConnectionError(
-                    f"Icecast connection {self.mount_name} is closed."
+                raise AudioServerConnectionError(
+                    f"Icecast connection {self.mount_path} is closed."
                 )
 
             try:
@@ -95,31 +71,31 @@ class IcecastConnection:
                 return
             except Exception as send_error:
                 if self._closed_event.is_set():
-                    raise IcecastConnectionError(
-                        f"Failed sending packet to {self.mount_name}: connection closed."
+                    raise AudioServerConnectionError(
+                        f"Failed sending packet to {self.mount_path}: connection closed."
                     ) from send_error
                 logging.warning(
                     "Send failed to %s, reconnecting: %s",
-                    self.mount_name,
+                    self.mount_path,
                     send_error,
                 )
                 try:
                     if not self._reconnect_with_shutdown_support():
-                        raise IcecastConnectionError(
-                            f"Failed sending packet to {self.mount_name}: connection closed."
+                        raise AudioServerConnectionError(
+                            f"Failed sending packet to {self.mount_path}: connection closed."
                         ) from send_error
-                    logging.info("Reconnected to Icecast mount %s.", self.mount_name)
+                    logging.info("Reconnected to Icecast mount %s.", self.mount_path)
                     # Re-attempt send immediately after a successful reconnect.
                     continue
-                except IcecastConnectionError as reconnect_error:
+                except AudioServerConnectionError as reconnect_error:
                     logging.warning(
                         "Reconnect failed for %s, will retry: %s",
-                        self.mount_name,
+                        self.mount_path,
                         reconnect_error,
                     )
                 if self._closed_event.wait(timeout=retry_delay_seconds):
-                    raise IcecastConnectionError(
-                        f"Failed sending packet to {self.mount_name}: connection closed."
+                    raise AudioServerConnectionError(
+                        f"Failed sending packet to {self.mount_path}: connection closed."
                     ) from send_error
 
     def _run_reconnect(self) -> None:
@@ -142,7 +118,7 @@ class IcecastConnection:
                 reconnect_thread = Thread(
                     target=self._run_reconnect,
                     daemon=True,
-                    name=f"IcecastReconnect-{self.mount_name}",
+                    name=f"IcecastReconnect-{self.mount_path}",
                 )
                 self._reconnect_thread = reconnect_thread
                 reconnect_thread.start()
@@ -155,10 +131,10 @@ class IcecastConnection:
             reconnect_error = self._reconnect_error
 
         if reconnect_error is not None:
-            if isinstance(reconnect_error, IcecastConnectionError):
+            if isinstance(reconnect_error, AudioServerConnectionError):
                 raise reconnect_error
-            raise IcecastConnectionError(
-                f"Unexpected reconnect error for {self.mount_name}: {reconnect_error}"
+            raise AudioServerConnectionError(
+                f"Unexpected reconnect error for {self.mount_path}: {reconnect_error}"
             ) from reconnect_error
         return True
 
@@ -207,5 +183,5 @@ class IcecastConnection:
             if reconnect_thread.is_alive():
                 logging.warning(
                     "Reconnect thread for %s did not stop within 2 seconds.",
-                    self.mount_name,
+                    self.mount_path,
                 )

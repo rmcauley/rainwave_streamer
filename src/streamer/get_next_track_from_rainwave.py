@@ -1,8 +1,4 @@
-#########################################################################
-# This file was human written.
-#########################################################################
-
-from streamer.audio_track import AudioTrackInfo
+from streamer.decoders.audio_track import AudioTrackInfo
 from collections.abc import Callable
 
 type GetNextTrackFromRainwaveBlockingFn = Callable[[], AudioTrackInfo]

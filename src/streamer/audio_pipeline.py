@@ -1,29 +1,30 @@
-#########################################################################
-# This file was human-written, until the AI slop warning mid-way.
-#########################################################################
-
 import logging
 import time
 from collections import deque
 from threading import Lock
-from typing import Callable, Iterator
+from typing import Iterator
 
 import numpy as np
 
-from streamer.audio_track import (
+from streamer.decoders.audio_track import (
     AudioTrack,
+    AudioTrackConstructor,
     AudioTrackDecodeError,
     AudioTrackEOFError,
     AudioTrackOpenError,
+)
+from streamer.connectors.connection import (
+    AudioServerConnectionConstructor,
+)
+from streamer.encoder_senders.encoder_sender import (
+    EncoderSender,
+    EncoderSenderConstructor,
 )
 from streamer.get_next_track_from_rainwave import (
     GetNextTrackFromRainwaveBlockingFn,
     MarkTrackInvalidOnRainwaveFireAndForgetFn,
 )
-from streamer.stream_constants import sample_rate, channels
-from streamer.encoder import Encoder
-from streamer.icecast_connection import IcecastConnection
-from streamer.stream_config import StreamConfig
+from streamer.stream_config import ShouldStopFn, StreamConfig, sample_rate, channels
 
 ahead_buffer_ms = 200
 ahead_buffer_seconds = ahead_buffer_ms / 1000
@@ -37,55 +38,44 @@ class AudioPipeline:
     _config: StreamConfig
     _realtime_start: float
     _realtime_samples_sent: int
-    _encoders: list[Encoder]
-    _connections: list[IcecastConnection]
+    _encoders: list[EncoderSender]
     _get_next_track_from_rainwave: GetNextTrackFromRainwaveBlockingFn
     _mark_track_invalid_on_rainwave: MarkTrackInvalidOnRainwaveFireAndForgetFn
-    _should_stop: Callable[[], bool]
+    _should_stop: ShouldStopFn
     _close_lock: Lock
     _closed: bool
 
     def __init__(
         self,
         config: StreamConfig,
+        server_connector: AudioServerConnectionConstructor,
+        encoder_sender: EncoderSenderConstructor,
+        audio_track: AudioTrackConstructor,
         get_next_track_from_rainwave: GetNextTrackFromRainwaveBlockingFn,
         mark_track_invalid_on_rainwave: MarkTrackInvalidOnRainwaveFireAndForgetFn,
-        should_stop: Callable[[], bool],
+        should_stop: ShouldStopFn,
     ) -> None:
         self._config = config
         self._realtime_start = time.monotonic()
         self._realtime_samples_sent = 0
         self._encoders = []
-        self._connections = []
         self._get_next_track_from_rainwave = get_next_track_from_rainwave
         self._mark_track_invalid_on_rainwave = mark_track_invalid_on_rainwave
         self._should_stop = should_stop
         self._close_lock = Lock()
         self._closed = False
+        self._audio_track = audio_track
 
         try:
-            mp3_conn = IcecastConnection(config, config.mp3, fmt="mp3")
-            self._connections.append(mp3_conn)
-            mp3_encoder = Encoder(
-                mp3_conn,
-                codec_name="mp3",
-                should_stop=self._should_stop,
+            self._encoders.append(
+                encoder_sender(config, "mp3", server_connector, should_stop)
             )
-            self._encoders.append(mp3_encoder)
-
-            opus_conn = IcecastConnection(config, config.opus, fmt="ogg")
-            self._connections.append(opus_conn)
-            opus_encoder = Encoder(
-                opus_conn,
-                codec_name="opus",
-                should_stop=self._should_stop,
+            self._encoders.append(
+                encoder_sender(config, "ogg", server_connector, should_stop)
             )
-            self._encoders.append(opus_encoder)
         except Exception:
             for encoder in reversed(self._encoders):
                 encoder.close()
-            for conn in self._connections:
-                conn.close()
             raise
 
     def _encode_frame(self, np_frame: np.ndarray, realtime_wait: bool) -> None:
@@ -96,15 +86,8 @@ class AudioPipeline:
         if realtime_wait:
             self._realtime_wait(np_frame.shape[1])
 
-        if np_frame.dtype != np.float32:
-            np_frame = np_frame.astype(np.float32, copy=False)
-        interleaved = np_frame.T
-        if not interleaved.flags.c_contiguous:
-            interleaved = np.ascontiguousarray(interleaved)
-        pcm_frame_bytes = interleaved.tobytes()
-
         for encoder in self._encoders:
-            encoder.encode(pcm_frame_bytes)
+            encoder.encode_and_send(np_frame)
 
     def _raise_if_shutting_down(self) -> None:
         if self._should_stop():
@@ -133,7 +116,7 @@ class AudioPipeline:
 
             try:
                 next_track_info = self._get_next_track_from_rainwave()
-                next_track = AudioTrack(next_track_info)
+                next_track = self._audio_track(next_track_info)
                 next_track_start_buffer: deque[np.ndarray] = (
                     next_track.get_start_buffer() if get_start_buffer else deque()
                 )
@@ -148,6 +131,7 @@ class AudioPipeline:
     def stream_tracks(
         self,
     ) -> None:
+        current_track: AudioTrack | None = None
         try:
             (current_track, _) = self._get_next_track(get_start_buffer=False)
 
@@ -184,8 +168,12 @@ class AudioPipeline:
                     for frame in next_track_start:
                         self._encode_frame(frame, realtime_wait=True)
 
+                finished_track = current_track
                 current_track = next_track
+                finished_track.close()
         finally:
+            if current_track is not None:
+                current_track.close()
             self.close()
 
     def close(self) -> None:
@@ -196,8 +184,6 @@ class AudioPipeline:
 
         for encoder in self._encoders:
             encoder.close()
-        for connection in self._connections:
-            connection.close()
 
     #########################################################################
     # Beware: below is AI slop territory

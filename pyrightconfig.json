@@ -7,5 +7,14 @@
     "**/node_modules",
     "**/.*",
     ".venv"
-  ]
+  ],
+  "typeCheckingMode": "strict",
+  "strict": ["src"],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": ["src"]
+    }
+  ],
+  "reportMissingModuleSource": "none"
 }

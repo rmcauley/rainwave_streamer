@@ -1,37 +1,95 @@
 import asyncio
 import logging
-import signal
+import sys
 import time
 import tracemalloc
 from concurrent.futures import Future
-from threading import Event, Thread
+from threading import Event, Lock, Thread
+from typing import Literal
 
 import psutil
 
-from streamer.connectors.icecast_connection import IcecastConnection
-from streamer.decoders.audio_track import AudioTrackInfo
-from streamer.encoder_senders.subprocess_encoder import SubprocessEncoderSender
+import streamer.audio_pipeline as audio_pipeline_module
+from streamer.audio_pipeline import AudioPipeline, AudioPipelineGracefulShutdownError
+from streamer.decoders.gstreamer_audio_track import AudioTrackInfo
 from streamer.get_next_track_from_rainwave import (
     get_next_track_from_rainwave,
     mark_track_invalid_on_rainwave,
 )
-from streamer.audio_pipeline import AudioPipeline, AudioPipelineGracefulShutdownError
-from streamer.decoders.gstreamer_audio_track import GstreamerAudioTrack
 from streamer.stream_config import StreamConfig
+from streamer.stream_constants import mp3_bitrate_approx, opus_bitrate_approx
+from streamer.stream_mount import StreamMount
 
 memory_log_interval_seconds = 30.0
 bytes_per_mebibyte = 1024 * 1024
 tracemalloc_frames = 25
 
 
-async def stream_forever(config: StreamConfig) -> None:
+class NullSinkConnection:
+    """
+    Drop-in replacement for IcecastConnection that discards encoded bytes.
+    """
+
+    def __init__(
+        self,
+        config: StreamConfig,
+        mount: StreamMount,
+        *,
+        fmt: Literal["mp3", "ogg"],
+    ) -> None:
+        del config
+        del fmt
+        self.mount_name = mount.mount
+        self._closed = False
+        self._bytes_sent = 0
+        self._lock = Lock()
+
+    def send(self, data: bytes) -> None:
+        if not data:
+            return
+        with self._lock:
+            if self._closed:
+                return
+            self._bytes_sent += len(data)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+
+
+def _build_null_stream_config() -> StreamConfig:
+    return StreamConfig(
+        host="127.0.0.1",
+        port=8000,
+        password="unused",
+        mp3=StreamMount(
+            mount="null_sink.mp3",
+            bitrate=mp3_bitrate_approx,
+            name="Null Sink Memory Leak Test",
+            description="Local sink test; no Icecast connection.",
+            genre="Test",
+            url="http://localhost/null_sink.mp3",
+            public=0,
+        ),
+        opus=StreamMount(
+            mount="null_sink.ogg",
+            bitrate=opus_bitrate_approx,
+            name="Null Sink Memory Leak Test",
+            description="Local sink test; no Icecast connection.",
+            genre="Test",
+            url="http://localhost/null_sink.ogg",
+            public=0,
+        ),
+    )
+
+
+async def stream_forever_to_null_sink() -> None:
     loop = asyncio.get_running_loop()
     shutdown_requested = Event()
-    shutting_down = Event()
     worker_error: list[BaseException] = []
     pipeline: AudioPipeline | None = None
     worker: Thread | None = None
-    installed_signal_handlers: list[signal.Signals] = []
+
     if not tracemalloc.is_tracing():
         tracemalloc.start(tracemalloc_frames)
     process = psutil.Process()
@@ -69,8 +127,9 @@ async def stream_forever(config: StreamConfig) -> None:
             raise AudioPipelineGracefulShutdownError()
         future = asyncio.run_coroutine_threadsafe(get_next_track_from_rainwave(), loop)
         try:
-            # Review note: this strict timeout is intentional to fail fast.
             track_info = future.result(timeout=2.0)
+            if track_info is None:
+                raise RuntimeError("No track info returned by get_next_track.")
             return track_info
         except Exception as e:
             future.cancel()
@@ -104,46 +163,28 @@ async def stream_forever(config: StreamConfig) -> None:
         except AudioPipelineGracefulShutdownError:
             shutdown_requested.set()
         except Exception as e:
-            if shutting_down.is_set():
-                logging.warning(
-                    "Worker exception during shutdown (suppressed): %s",
-                    e,
-                    exc_info=e,
-                )
-                return
             worker_error.append(e)
             shutdown_requested.set()
 
-    def handle_intentional_signal(signal_name: str) -> None:
-        logging.info(
-            "Received %s. Starting intentional shutdown handling.", signal_name
-        )
-        shutdown_requested.set()
+    original_connection_class = audio_pipeline_module.IcecastConnection
+    audio_pipeline_module.IcecastConnection = NullSinkConnection  # type: ignore[assignment]
 
     try:
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, handle_intentional_signal, sig.name)
-                installed_signal_handlers.append(sig)
-            except (NotImplementedError, RuntimeError, ValueError):
-                pass
-
         pipeline = AudioPipeline(
-            audio_track=GstreamerAudioTrack,
-            config=config,
-            encoder_sender=SubprocessEncoderSender,
-            get_next_track_from_rainwave=next_track_blocking,
-            mark_track_invalid_on_rainwave=mark_track_invalid_fire_and_forget,
-            server_connector=IcecastConnection,
-            should_stop=should_stop_workers,
+            _build_null_stream_config(),
+            next_track_blocking,
+            mark_track_invalid_fire_and_forget,
+            should_stop_workers,
         )
         worker = Thread(target=worker_target, daemon=True, name="AudioPipelineWorker")
         worker.start()
+
         while worker.is_alive():
             log_memory_usage()
             if worker_error:
                 raise worker_error[0]
             await asyncio.sleep(0.2)
+
         if worker_error:
             raise worker_error[0]
     except asyncio.CancelledError:
@@ -151,16 +192,8 @@ async def stream_forever(config: StreamConfig) -> None:
         raise
     finally:
         log_memory_usage(force=True)
-        shutting_down.set()
         shutdown_requested.set()
-
-        # Review note: this daemon intentionally allows repeated SIGINT/SIGTERM to
-        # short-circuit graceful shutdown if the operator insists.
-        for installed_sig in installed_signal_handlers:
-            try:
-                loop.remove_signal_handler(installed_sig)
-            except Exception:
-                pass
+        audio_pipeline_module.IcecastConnection = original_connection_class
 
         worker_stopped = worker is None
         if worker is not None:
@@ -170,3 +203,23 @@ async def stream_forever(config: StreamConfig) -> None:
             logging.warning(
                 "Worker did not stop within 2 seconds; continuing shutdown."
             )
+
+
+def main() -> int:
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    try:
+        asyncio.run(stream_forever_to_null_sink())
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        logging.exception("Null sink memory test crashed.")
+        raise
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

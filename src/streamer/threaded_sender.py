@@ -1,13 +1,12 @@
-#########################################################################
-# This file was AI generated with no human supervision.
-#########################################################################
-
 import logging
 import queue
 from collections.abc import Callable
 from threading import Condition, Event, Thread
 
-from streamer.icecast_connection import IcecastConnection, IcecastConnectionError
+from streamer.connectors.connection import (
+    AudioServerConnection,
+    AudioServerConnectionError,
+)
 
 
 class ThreadedSender:
@@ -18,7 +17,7 @@ class ThreadedSender:
 
     def __init__(
         self,
-        conn: IcecastConnection,
+        conn: AudioServerConnection,
         max_buffer_bytes: int = 64 * 1024,
         should_stop: Callable[[], bool] = lambda: False,
     ) -> None:
@@ -30,7 +29,7 @@ class ThreadedSender:
         self._buffer_cond = Condition()
         self._stop_event = Event()
         self._thread = Thread(
-            target=self._worker, daemon=True, name=f"Sender-{conn.mount_name}"
+            target=self._worker, daemon=True, name=f"Sender-{conn.mount_path}"
         )
         self._thread.start()
 
@@ -46,11 +45,11 @@ class ThreadedSender:
                 self._conn.send(data)
             except queue.Empty:
                 continue
-            except IcecastConnectionError as send_error:
+            except AudioServerConnectionError as send_error:
                 if self._stop_event.is_set():
                     break
                 logging.error(
-                    "Sender failed for %s: %s", self._conn.mount_name, send_error
+                    "Sender failed for %s: %s", self._conn.mount_path, send_error
                 )
             except Exception as e:
                 logging.error(f"Sender thread error: {e}")
@@ -72,7 +71,9 @@ class ThreadedSender:
                 if self._should_stop():
                     # Shutdown path: bypass backpressure so the encoder/pipeline can unwind.
                     return len(data)
-                would_overflow = self._buffered_bytes + data_len > self._max_buffer_bytes
+                would_overflow = (
+                    self._buffered_bytes + data_len > self._max_buffer_bytes
+                )
                 # Allow one oversized packet through only when buffer is empty.
                 oversize_allowed = (
                     data_len > self._max_buffer_bytes and self._buffered_bytes == 0
