@@ -4,7 +4,7 @@ import logging
 import sys
 from typing import Sequence
 
-from streamer.encoder_senders.subprocess_encoder import SubprocessEncoderSender
+from streamer.encoder_senders.gstreamer_encoder import GstreamerEncoderSender
 from streamer.sinks.icecast_sink import IcecastSink
 from streamer.sinks.null_sink import NullSink
 from streamer.stream_config import StreamConfig
@@ -79,7 +79,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config=stream_config,
                 connection=NullSink if args.perftest else IcecastSink,
                 decoder=GstreamerTrackDecoder,
-                encoder=SubprocessEncoderSender,
+                encoder=GstreamerEncoderSender,
                 show_performance=args.perftest,
                 use_realtime_wait=False if args.perftest else True,
             )

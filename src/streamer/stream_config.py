@@ -6,7 +6,8 @@ from typing import Callable, Literal
 SupportedFormats = Literal["mp3", "ogg"]
 ShouldStopFn = Callable[[], bool]
 
-bitrate_approx = 128
+mp3_bitrate_approx = 128
+opus_bitrate_approx = 112
 sample_rate = 48000
 channels = 2
 layout = "stereo"

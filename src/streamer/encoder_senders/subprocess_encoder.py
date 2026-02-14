@@ -16,7 +16,7 @@ from streamer.stream_config import (
     SupportedFormats,
     sample_rate,
     channels,
-    bitrate_approx,
+    mp3_bitrate_approx,
 )
 from streamer.threaded_sender import ThreadedSender
 
@@ -88,7 +88,7 @@ class SubprocessEncoderSender(EncoderSender):
                     "-c:a",
                     "libmp3lame",
                     "-b:a",
-                    f"{bitrate_approx}k",
+                    f"{mp3_bitrate_approx}k",
                     "-f",
                     "mp3",
                     "pipe:1",
@@ -100,7 +100,7 @@ class SubprocessEncoderSender(EncoderSender):
                     "-c:a",
                     "libopus",
                     "-b:a",
-                    f"{bitrate_approx}k",
+                    f"{mp3_bitrate_approx}k",
                     "-vbr",
                     "on",
                     "-application",
