@@ -2,11 +2,12 @@ import logging
 import time
 from collections import deque
 from threading import Lock
-from typing import Iterator
+from typing import Any, Iterator
 
 import numpy as np
 
 from streamer.track_decoders.track_decoder import (
+    TrackFrame,
     TrackDecoder,
     AudioTrackDecoderConstructor,
     TrackDecodeError,
@@ -25,6 +26,10 @@ from streamer.get_next_track_from_rainwave import (
     MarkTrackInvalidOnRainwaveFireAndForgetFn,
 )
 from streamer.stream_config import ShouldStopFn, StreamConfig, sample_rate, channels
+import gi
+
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst
 
 ahead_buffer_ms = 200
 ahead_buffer_seconds = ahead_buffer_ms / 1000
@@ -73,16 +78,16 @@ class AudioPipeline:
                 encoder.close()
             raise
 
-    def _encode_frame(self, np_frame: np.ndarray, realtime_wait: bool) -> None:
+    def _encode_frame(self, frame: TrackFrame, realtime_wait: bool) -> None:
         self._raise_if_shutting_down()
 
-        if np_frame.shape[1] == 0:
+        if frame.samples <= 0:
             return
         if self._use_realtime_wait and realtime_wait:
-            self._realtime_wait(np_frame.shape[1])
+            self._realtime_wait(frame.samples)
 
         for encoder in self._encoders:
-            encoder.encode_and_send(np_frame)
+            encoder.encode_and_send(frame.buffer)
 
     def _raise_if_shutting_down(self) -> None:
         if self._should_stop():
@@ -104,7 +109,7 @@ class AudioPipeline:
 
     def _get_next_track(
         self, get_start_buffer: bool = True
-    ) -> tuple[TrackDecoder, deque[np.ndarray]]:
+    ) -> tuple[TrackDecoder, deque[TrackFrame]]:
         # Attempt to fetch from Rainwave's backend continually until Rainwave responds.
         while True:
             self._raise_if_shutting_down()
@@ -112,7 +117,7 @@ class AudioPipeline:
             try:
                 next_track_info = self._get_next_track_from_rainwave()
                 next_track = self._audio_track(next_track_info)
-                next_track_start_buffer: deque[np.ndarray] = (
+                next_track_start_buffer: deque[TrackFrame] = (
                     next_track.get_start_buffer() if get_start_buffer else deque()
                 )
                 logging.info(f"Next song queued: {next_track_info.path}")
@@ -194,11 +199,44 @@ class AudioPipeline:
     # Beware: below is AI slop territory
     #########################################################################
 
-    def _detect_fade(self, frames: deque[np.ndarray], *, direction: str) -> bool:
+    def _buffer_to_float32(self, buffer: Any) -> np.ndarray:
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            return np.empty(0, dtype=np.float32)
+        try:
+            return np.frombuffer(map_info.data, dtype=np.float32).copy()
+        finally:
+            buffer.unmap(map_info)
+
+    def _slice_frame(
+        self, frame: TrackFrame, start_sample: int, sample_count: int
+    ) -> TrackFrame:
+        if sample_count <= 0:
+            empty = Gst.Buffer.new_allocate(None, 0, None)
+            if empty is None:
+                raise RuntimeError("Failed to allocate empty Gst.Buffer.")
+            return TrackFrame(buffer=empty, samples=0)
+
+        bytes_per_sample = channels * 4
+        start_byte = start_sample * bytes_per_sample
+        length_bytes = sample_count * bytes_per_sample
+        success, map_info = frame.buffer.map(Gst.MapFlags.READ)
+        if not success:
+            raise RuntimeError("Failed to map Gst.Buffer for slicing.")
+        try:
+            new_buffer = Gst.Buffer.new_allocate(None, length_bytes, None)
+            if new_buffer is None:
+                raise RuntimeError("Failed to allocate Gst.Buffer slice.")
+            new_buffer.fill(0, map_info.data[start_byte : start_byte + length_bytes])
+            return TrackFrame(buffer=new_buffer, samples=sample_count)
+        finally:
+            frame.buffer.unmap(map_info)
+
+    def _detect_fade(self, frames: deque[TrackFrame], *, direction: str) -> bool:
         if not frames:
             return False
 
-        total_samples = sum(frame.shape[1] for frame in frames)
+        total_samples = sum(frame.samples for frame in frames)
         if total_samples < (sample_rate * 0.5):  # Need at least 0.5s to judge fade
             return False
 
@@ -208,13 +246,17 @@ class AudioPipeline:
         window_samples = 0
 
         for frame in frames:
-            frame_samples = frame.shape[1]
+            frame_samples = frame.samples
             if frame_samples == 0:
                 continue
+            interleaved = self._buffer_to_float32(frame.buffer)
+            if interleaved.size <= 0:
+                continue
+            samples = interleaved.reshape(frame_samples, channels)
             start = 0
             while start < frame_samples:
                 take = min(window - window_samples, frame_samples - start)
-                chunk = frame[:, start : start + take]
+                chunk = samples[start : start + take]
                 window_sum += float(np.sum(chunk * chunk))
                 window_samples += take
                 start += take
@@ -238,16 +280,16 @@ class AudioPipeline:
         return slope > threshold
 
     def _mix_crossfade(
-        self, tail: deque[np.ndarray], head: deque[np.ndarray]
-    ) -> Iterator[np.ndarray]:
+        self, tail: deque[TrackFrame], head: deque[TrackFrame]
+    ) -> Iterator[TrackFrame]:
         if not tail or not head:
             return
 
-        tail_samples = sum(frame.shape[1] for frame in tail)
+        tail_samples = sum(frame.samples for frame in tail)
         if tail_samples <= 0:
             return
 
-        head_samples = sum(frame.shape[1] for frame in head)
+        head_samples = sum(frame.samples for frame in head)
         if head_samples <= 0:
             return
 
@@ -257,7 +299,7 @@ class AudioPipeline:
         # Shrink the tail buffer so we only need to handle the "tail is shorter/equal" case.
         while tail_samples > max_fade_length_in_samples:
             tail_frame = tail.popleft()
-            tail_samples -= tail_frame.shape[1]
+            tail_samples -= tail_frame.samples
             yield tail_frame
         if tail_samples <= 0:
             while head:
@@ -268,45 +310,65 @@ class AudioPipeline:
         mixed_samples = 0
 
         def _take_head_samples(count: int) -> np.ndarray:
-            out = np.zeros((channels, count), dtype=np.float32)
+            out = np.zeros((count, channels), dtype=np.float32)
             copied = 0
             while copied < count and head:
                 head_frame = head.popleft()
-                frame_samples = head_frame.shape[1]
+                frame_samples = head_frame.samples
                 if frame_samples == 0:
                     continue
+                frame_data = self._buffer_to_float32(head_frame.buffer)
+                if frame_data.size <= 0:
+                    continue
+                frame_data = frame_data.reshape(frame_samples, channels)
 
                 take = min(frame_samples, count - copied)
-                out[:, copied : copied + take] = head_frame[:, :take]
+                out[copied : copied + take] = frame_data[:take]
                 copied += take
 
                 if take < frame_samples:
-                    head.appendleft(head_frame[:, take:])
+                    head.appendleft(
+                        self._slice_frame(
+                            head_frame,
+                            start_sample=take,
+                            sample_count=frame_samples - take,
+                        )
+                    )
 
             return out
 
         while tail:
             tail_frame = tail.popleft()
-            frame_samples = tail_frame.shape[1]
+            frame_samples = tail_frame.samples
             if frame_samples == 0:
                 continue
 
             head_frame = _take_head_samples(frame_samples)
             if fade_denom <= 0:
-                fade_in = np.ones(frame_samples, dtype=np.float32)
+                fade_in = np.ones((frame_samples, 1), dtype=np.float32)
             else:
                 fade_in = np.linspace(
                     mixed_samples / fade_denom,
                     (mixed_samples + frame_samples - 1) / fade_denom,
                     num=frame_samples,
                     dtype=np.float32,
-                )
+                ).reshape(frame_samples, 1)
             fade_out = 1.0 - fade_in
             mixed_samples += frame_samples
-            np.multiply(tail_frame, fade_out, out=tail_frame, casting="unsafe")
+
+            tail_data = self._buffer_to_float32(tail_frame.buffer)
+            if tail_data.size <= 0:
+                continue
+            tail_data = tail_data.reshape(frame_samples, channels)
+            np.multiply(tail_data, fade_out, out=tail_data, casting="unsafe")
             np.multiply(head_frame, fade_in, out=head_frame, casting="unsafe")
-            tail_frame += head_frame
-            yield tail_frame
+            mixed = tail_data + head_frame
+
+            out_buffer = Gst.Buffer.new_allocate(None, mixed.nbytes, None)
+            if out_buffer is None:
+                raise RuntimeError("Failed to allocate mixed Gst.Buffer.")
+            out_buffer.fill(0, mixed.astype(np.float32, copy=False).tobytes())
+            yield TrackFrame(buffer=out_buffer, samples=frame_samples)
 
         # Flush any head frames that were not part of the overlap.
         while head:

@@ -3,7 +3,7 @@ from collections import deque
 from dataclasses import dataclass
 import logging
 import math
-from typing import Iterator
+from typing import Any, Iterator
 
 import numpy as np
 
@@ -13,6 +13,11 @@ from streamer.stream_config import (
     lookahead_seconds,
     silence_threshold_linear,
 )
+
+import gi
+
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst
 
 
 # Used to signal to the audio pipeline that the track is finished
@@ -48,6 +53,12 @@ class TrackInfo:
     gain_db: float
 
 
+@dataclass
+class TrackFrame:
+    buffer: Any
+    samples: int
+
+
 class TrackDecoder:
     path: str
     _gain_db: float
@@ -56,7 +67,7 @@ class TrackDecoder:
 
     # Decoded audio buffer so we can easily and safely trim silence.
     # Will be kept at approx lookahead_seconds length.
-    audio_buffer: deque[np.ndarray]
+    audio_buffer: deque[TrackFrame]
     audio_buffer_samples: int
 
     def __init__(self, track_info: TrackInfo) -> None:
@@ -98,17 +109,31 @@ class TrackDecoder:
         except Exception:
             pass
 
-    def _is_frame_silent(self, frame: np.ndarray) -> bool:
-        return frame.shape[1] > 0 and np.max(np.abs(frame)) <= silence_threshold_linear
+    def _is_frame_silent(self, frame: TrackFrame) -> bool:
+        if frame.samples <= 0:
+            return False
+
+        buffer = frame.buffer
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            return False
+
+        try:
+            interleaved = np.frombuffer(map_info.data, dtype=np.float32)
+            return interleaved.size > 0 and (
+                np.max(np.abs(interleaved)) <= silence_threshold_linear
+            )
+        finally:
+            buffer.unmap(map_info)
 
     @abstractmethod
-    def _get_resampled_and_gained_next_frames_from_track(self) -> Iterator[np.ndarray]:
+    def _get_resampled_and_gained_next_frames_from_track(self) -> Iterator[TrackFrame]:
         # Decodes the next packet(s) from the track, resamples to `sample_rate`, applies gain,
         # and yields the resulting frame(s).
         raise NotImplementedError()
 
     @abstractmethod
-    def get_start_buffer(self) -> deque[np.ndarray]:
+    def get_start_buffer(self) -> deque[TrackFrame]:
         # Returns the first `crossfade_seconds` from the track reader using _get_resampled_and_gained_next_frames_from_track.
         # Skips all silent frames.
         # Does not use self._audio_buffer, returns a fresh buffer while consuming from a shared reader.
@@ -121,21 +146,21 @@ class TrackDecoder:
                 return
 
             popped = self.audio_buffer.pop()
-            self.audio_buffer_samples -= popped.shape[1]
+            self.audio_buffer_samples -= popped.samples
 
-    def get_frames(self) -> Iterator[np.ndarray]:
+    def get_frames(self) -> Iterator[TrackFrame]:
         try:
             while self.audio_buffer_samples < (lookahead_seconds * sample_rate):
                 for frame in self._get_resampled_and_gained_next_frames_from_track():
                     self.audio_buffer.append(frame)
-                    self.audio_buffer_samples += frame.shape[1]
+                    self.audio_buffer_samples += frame.samples
 
             while True:
                 for frame in self._get_resampled_and_gained_next_frames_from_track():
                     self.audio_buffer.append(frame)
-                    self.audio_buffer_samples += frame.shape[1]
+                    self.audio_buffer_samples += frame.samples
                     yield_frame = self.audio_buffer.popleft()
-                    self.audio_buffer_samples -= yield_frame.shape[1]
+                    self.audio_buffer_samples -= yield_frame.samples
                     yield yield_frame
         except TrackNoMoreFramesError:
             logging.debug(f"Finished decoding {self.path}")
@@ -147,7 +172,7 @@ class TrackDecoder:
 
         while self.audio_buffer_samples > (crossfade_seconds * sample_rate):
             yield_frame = self.audio_buffer.popleft()
-            self.audio_buffer_samples -= yield_frame.shape[1]
+            self.audio_buffer_samples -= yield_frame.samples
             yield yield_frame
 
         raise TrackEOFError()

@@ -2,8 +2,6 @@ import logging
 from threading import Lock, Thread
 from typing import Any
 
-import numpy as np
-
 from streamer.encoder_senders.encoder_sender import (
     EncoderSender,
     EncoderSenderEncodeError,
@@ -13,16 +11,18 @@ from streamer.stream_config import (
     ShouldStopFn,
     StreamConfig,
     SupportedFormats,
+    mp3_bitrate_approx,
     opus_bitrate_approx,
     channels,
     sample_rate,
 )
-from streamer.threaded_sender import ThreadedSender
 
 import gi
 
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
+
+message_poll_interval_buffers = 64
 
 
 class GstreamerEncoderSender(EncoderSender):
@@ -30,12 +30,13 @@ class GstreamerEncoderSender(EncoderSender):
     _appsrc: Any
     _appsink: Any
     _bus: Any
-    _sender: ThreadedSender
     _appsink_thread: Thread
     _closed: bool
     _close_lock: Lock
     _worker_error: Exception | None
     _worker_error_lock: Lock
+    _encode_pushes_since_poll: int
+    _appsink_pulls_since_poll: int
 
     def __init__(
         self,
@@ -49,7 +50,8 @@ class GstreamerEncoderSender(EncoderSender):
         self._close_lock = Lock()
         self._worker_error = None
         self._worker_error_lock = Lock()
-        self._sender = ThreadedSender(self._conn, should_stop=should_stop)
+        self._encode_pushes_since_poll = 0
+        self._appsink_pulls_since_poll = 0
 
         try:
             Gst.init(None)
@@ -57,6 +59,10 @@ class GstreamerEncoderSender(EncoderSender):
             self._appsrc = self._get_required_element("src")
             self._appsink = self._get_required_element("sink")
             self._bus = self._pipeline.get_bus()
+            if self._bus is None:
+                raise EncoderSenderEncodeError(
+                    "Failed to get GStreamer encoder bus."
+                )
 
             state_result = self._pipeline.set_state(Gst.State.PLAYING)
             if state_result == Gst.StateChangeReturn.FAILURE:
@@ -71,42 +77,31 @@ class GstreamerEncoderSender(EncoderSender):
             )
             self._appsink_thread.start()
         except Exception:
-            self._sender.close()
             pipeline = getattr(self, "_pipeline", None)
             if pipeline is not None:
                 try:
                     pipeline.set_state(Gst.State.NULL)
                 except Exception:
                     pass
+            self._conn.close()
             raise
 
-    def encode_and_send(self, np_frame: np.ndarray) -> None:
+    def encode_and_send(self, pcm_buffer: Any) -> None:
         self._raise_if_worker_failed()
-        self._poll_gst_messages()
 
-        if np_frame.dtype != np.float32:
-            np_frame = np_frame.astype(np.float32, copy=False)
-        interleaved = np_frame.T
-        if not interleaved.flags.c_contiguous:
-            interleaved = np.ascontiguousarray(interleaved)
-        pcm_frame_bytes = interleaved.tobytes()
-
-        if not pcm_frame_bytes:
+        if pcm_buffer is None:
+            return
+        if int(pcm_buffer.get_size()) <= 0:
             return
 
-        gst_buffer = Gst.Buffer.new_allocate(None, len(pcm_frame_bytes), None)
-        if gst_buffer is None:
-            raise EncoderSenderEncodeError(
-                "Failed to allocate GStreamer buffer for encoded frame input."
-            )
-        gst_buffer.fill(0, pcm_frame_bytes)
-
-        flow = self._appsrc.emit("push-buffer", gst_buffer)
+        flow = self._appsrc.emit("push-buffer", pcm_buffer)
         if flow != Gst.FlowReturn.OK:
+            self._poll_gst_messages(force=True)
             raise EncoderSenderEncodeError(
                 f"GStreamer encoder push-buffer failed: {flow.value_nick}"
             )
 
+        self._encode_pushes_since_poll += 1
         self._poll_gst_messages()
         self._raise_if_worker_failed()
 
@@ -136,7 +131,7 @@ class GstreamerEncoderSender(EncoderSender):
             if appsink_thread.is_alive():
                 logging.error("GStreamer appsink thread did not stop within 2 seconds.")
 
-        self._sender.close()
+        self._conn.close()
 
     def _make_gst_element(self, element_name: str, instance_name: str) -> Any:
         element = Gst.ElementFactory.make(element_name, instance_name)
@@ -148,6 +143,10 @@ class GstreamerEncoderSender(EncoderSender):
 
     def _build_pipeline(self, format: SupportedFormats) -> Any:
         pipeline = Gst.Pipeline.new(f"gstreamer-encoder-{format}")
+        if pipeline is None:
+            raise EncoderSenderEncodeError(
+                "Failed to create GStreamer encoder pipeline."
+            )
 
         appsrc = self._make_gst_element("appsrc", "src")
         audioconvert = self._make_gst_element("audioconvert", "convert")
@@ -176,6 +175,7 @@ class GstreamerEncoderSender(EncoderSender):
             encoder = self._make_gst_element("lamemp3enc", "encoder")
             encoder.set_property("target", "quality")
             encoder.set_property("quality", 7.0)
+            encoder.set_property("bitrate", mp3_bitrate_approx)
             pipeline.add(encoder)
 
             if not appsrc.link(audioconvert):
@@ -231,37 +231,34 @@ class GstreamerEncoderSender(EncoderSender):
                 self._poll_gst_messages()
                 sample = self._appsink.emit("pull-sample")
                 if sample is None:
-                    self._poll_gst_messages()
+                    self._poll_gst_messages(force=True)
                     return
 
                 buffer = sample.get_buffer()
                 if buffer is None:
                     continue
 
-                success, map_info = buffer.map(Gst.MapFlags.READ)
-                if not success:
-                    raise EncoderSenderEncodeError(
-                        "Failed to map encoded GStreamer buffer."
-                    )
-
-                try:
-                    data = bytes(map_info.data)
-                finally:
-                    buffer.unmap(map_info)
-
-                if data:
-                    self._sender.write(data)
+                self._conn.send(buffer)
+                self._appsink_pulls_since_poll += 1
         except Exception as e:
             with self._worker_error_lock:
                 self._worker_error = e
             logging.error("GStreamer encoder appsink worker failed: %s", e)
 
-    def _poll_gst_messages(self) -> None:
-        if self._bus is None:
+    def _poll_gst_messages(self, *, force: bool = False) -> None:
+        bus = self._bus
+        if bus is None:
             return
+        if not force:
+            if self._encode_pushes_since_poll < message_poll_interval_buffers:
+                if self._appsink_pulls_since_poll < message_poll_interval_buffers:
+                    return
+            self._encode_pushes_since_poll = 0
+            self._appsink_pulls_since_poll = 0
+
         message_types = Gst.MessageType.ERROR | Gst.MessageType.EOS
         while True:
-            msg = self._bus.timed_pop_filtered(0, message_types)
+            msg = bus.timed_pop_filtered(0, message_types)
             if msg is None:
                 return
             if msg.type == Gst.MessageType.ERROR:

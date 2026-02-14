@@ -1,5 +1,5 @@
 from abc import abstractmethod
-import numpy as np
+from typing import Any
 
 from streamer.sinks.sink import (
     AudioSink,
@@ -39,7 +39,7 @@ class EncoderSender:
         self._should_stop = should_stop
 
     @abstractmethod
-    def encode_and_send(self, np_frame: np.ndarray) -> None:
+    def encode_and_send(self, pcm_buffer: Any) -> None:
         raise NotImplementedError()
 
     def close(self) -> None:

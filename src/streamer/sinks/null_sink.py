@@ -1,4 +1,5 @@
 from threading import Lock
+from typing import Any
 
 from streamer.sinks.sink import (
     AudioSink,
@@ -18,15 +19,18 @@ class NullSink(AudioSink):
         self._bytes_sent = 0
         self._lock = Lock()
 
-    def send(self, data: bytes) -> None:
-        if not data:
+    def send(self, data: Any) -> None:
+        if data is None:
+            return
+        data_len = int(data.get_size())
+        if data_len <= 0:
             return
         with self._lock:
             if self._closed:
                 raise AudioSinkError(
                     f"Null sink connection {self.mount_path} is closed."
                 )
-            self._bytes_sent += len(data)
+            self._bytes_sent += data_len
 
     def reconnect(self) -> None:
         with self._lock:

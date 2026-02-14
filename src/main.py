@@ -5,7 +5,7 @@ import sys
 from typing import Sequence
 
 from streamer.encoder_senders.gstreamer_encoder import GstreamerEncoderSender
-from streamer.sinks.icecast_sink import IcecastSink
+from streamer.sinks.gstreamer_sink import GstreamerSink
 from streamer.sinks.null_sink import NullSink
 from streamer.stream_config import StreamConfig
 from stream_forever import stream_forever
@@ -77,7 +77,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         asyncio.run(
             stream_forever(
                 config=stream_config,
-                connection=NullSink if args.perftest else IcecastSink,
+                connection=NullSink if args.perftest else GstreamerSink,
                 decoder=GstreamerTrackDecoder,
                 encoder=GstreamerEncoderSender,
                 show_performance=args.perftest,

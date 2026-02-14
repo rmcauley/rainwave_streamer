@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from typing import Any
 
 from streamer.stream_config import StreamConfig, SupportedFormats
 
@@ -18,7 +19,7 @@ class AudioSink:
         self.mount_path = f"{config.stream_filename}.{format}"
 
     @abstractmethod
-    def send(self, data: bytes) -> None:
+    def send(self, data: Any) -> None:
         raise NotImplementedError()
 
     @abstractmethod

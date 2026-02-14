@@ -2,10 +2,9 @@ from collections import deque
 import logging
 from typing import Any, Iterator
 
-import numpy as np
-
 from streamer.track_decoders.track_decoder import (
     TrackDecoder,
+    TrackFrame,
     TrackDecodeError,
     TrackNoMoreFramesError,
     TrackOpenError,
@@ -21,6 +20,8 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
+message_poll_interval_buffers = 64
+
 
 class GstreamerTrackDecoder(TrackDecoder):
     _pipeline: Any
@@ -28,9 +29,11 @@ class GstreamerTrackDecoder(TrackDecoder):
     _bus: Any
     _eos: bool
     _closed: bool
+    _pulls_since_poll: int
 
     def _open_stream(self) -> None:
         self._eos = False
+        self._pulls_since_poll = 0
 
         try:
             Gst.init(None)
@@ -38,6 +41,8 @@ class GstreamerTrackDecoder(TrackDecoder):
             self._pipeline = pipeline
             self._appsink = appsink
             self._bus = bus
+            if bus is None:
+                raise TrackOpenError(self.path, "Failed to get GStreamer bus.")
 
             state_result = self._pipeline.set_state(Gst.State.PLAYING)
             if state_result == Gst.StateChangeReturn.FAILURE:
@@ -60,14 +65,17 @@ class GstreamerTrackDecoder(TrackDecoder):
 
     def _build_gst_pipeline(self, path: str) -> tuple[Any, Any, Any]:
         pipeline = Gst.Pipeline.new("audio-track-decode")
+
         filesrc = self._make_gst_element("filesrc", "src")
         decodebin = self._make_gst_element("decodebin", "decode")
         audioconvert = self._make_gst_element("audioconvert", "convert")
         audioresample = self._make_gst_element("audioresample", "resample")
+        volume = self._make_gst_element("volume", "gain")
         capsfilter = self._make_gst_element("capsfilter", "caps")
         appsink = self._make_gst_element("appsink", "sink")
 
         filesrc.set_property("location", path)
+        volume.set_property("volume", float(self._linear_gain))
         caps = Gst.Caps.from_string(
             f"audio/x-raw,format=F32LE,channels={channels},rate={sample_rate},layout=interleaved"
         )
@@ -81,6 +89,7 @@ class GstreamerTrackDecoder(TrackDecoder):
         pipeline.add(decodebin)
         pipeline.add(audioconvert)
         pipeline.add(audioresample)
+        pipeline.add(volume)
         pipeline.add(capsfilter)
         pipeline.add(appsink)
 
@@ -90,10 +99,10 @@ class GstreamerTrackDecoder(TrackDecoder):
             raise TrackOpenError(
                 self.path, "Failed to link audioconvert -> audioresample."
             )
-        if not audioresample.link(capsfilter):
-            raise TrackOpenError(
-                self.path, "Failed to link audioresample -> capsfilter."
-            )
+        if not audioresample.link(volume):
+            raise TrackOpenError(self.path, "Failed to link audioresample -> volume.")
+        if not volume.link(capsfilter):
+            raise TrackOpenError(self.path, "Failed to link volume -> capsfilter.")
         if not capsfilter.link(appsink):
             raise TrackOpenError(self.path, "Failed to link capsfilter -> appsink.")
 
@@ -132,9 +141,19 @@ class GstreamerTrackDecoder(TrackDecoder):
             except Exception:
                 pass
 
-    def get_start_buffer(self) -> deque[np.ndarray]:
+    def _buffer_samples(self, buffer: Any) -> int:
+        if buffer is None:
+            return 0
+        # F32LE interleaved; each sample across all channels is 4 * channels bytes.
+        bytes_per_sample = channels * 4
+        size = int(buffer.get_size())
+        if size <= 0:
+            return 0
+        return size // bytes_per_sample
+
+    def get_start_buffer(self) -> deque[TrackFrame]:
         # Get the start-of-song buffer, trimming silence, up to 5 seconds.
-        start_buffer: deque[np.ndarray] = deque()
+        start_buffer: deque[TrackFrame] = deque()
         start_buffer_samples = 0
         trimming = True
         try:
@@ -147,7 +166,7 @@ class GstreamerTrackDecoder(TrackDecoder):
                             continue
 
                     start_buffer.append(frame)
-                    start_buffer_samples += frame.shape[1]
+                    start_buffer_samples += frame.samples
         except Exception as e:
             logging.error(
                 "Failed to decode initial crossfade audio buffer for track %s: %s. Is the song too short to be used on Rainwave?",
@@ -158,13 +177,18 @@ class GstreamerTrackDecoder(TrackDecoder):
 
         return start_buffer
 
-    def _poll_gst_messages(self) -> None:
-        if self._bus is None:
+    def _poll_gst_messages(self, *, force: bool = False) -> None:
+        bus = self._bus
+        if bus is None:
             return
+        if not force:
+            if self._pulls_since_poll < message_poll_interval_buffers:
+                return
+            self._pulls_since_poll = 0
 
         message_types = Gst.MessageType.ERROR | Gst.MessageType.EOS
         while True:
-            msg = self._bus.timed_pop_filtered(0, message_types)
+            msg = bus.timed_pop_filtered(0, message_types)
             if msg is None:
                 return
 
@@ -176,36 +200,7 @@ class GstreamerTrackDecoder(TrackDecoder):
             if msg.type == Gst.MessageType.EOS:
                 self._eos = True
 
-    def _sample_to_frame(self, sample: Any) -> np.ndarray:
-        buffer = sample.get_buffer()
-        if buffer is None:
-            return np.empty((channels, 0), dtype=np.float32)
-
-        success, map_info = buffer.map(Gst.MapFlags.READ)
-        if not success:
-            raise TrackDecodeError(self.path, "Failed to map decoded PCM buffer.")
-
-        try:
-            interleaved = np.frombuffer(map_info.data, dtype=np.float32)
-            if interleaved.size <= 0:
-                return np.empty((channels, 0), dtype=np.float32)
-
-            total_frames = interleaved.size // channels
-            if total_frames <= 0:
-                return np.empty((channels, 0), dtype=np.float32)
-
-            usable_samples = total_frames * channels
-            if usable_samples != interleaved.size:
-                interleaved = interleaved[:usable_samples]
-
-            frame = interleaved.reshape(total_frames, channels).T.copy()
-            if self._linear_gain != np.float32(1.0):
-                np.multiply(frame, self._linear_gain, out=frame, casting="unsafe")
-            return frame
-        finally:
-            buffer.unmap(map_info)
-
-    def _get_resampled_and_gained_next_frames_from_track(self) -> Iterator[np.ndarray]:
+    def _get_resampled_and_gained_next_frames_from_track(self) -> Iterator[TrackFrame]:
         while True:
             self._poll_gst_messages()
             if self._eos:
@@ -213,11 +208,17 @@ class GstreamerTrackDecoder(TrackDecoder):
 
             sample = self._appsink.emit("pull-sample")
             if sample is None:
-                self._poll_gst_messages()
+                self._poll_gst_messages(force=True)
                 raise TrackNoMoreFramesError()
 
-            frame = self._sample_to_frame(sample)
-            if frame.shape[1] <= 0:
+            buffer = sample.get_buffer()
+            if buffer is None:
                 continue
-            yield frame
+
+            samples = self._buffer_samples(buffer)
+            if samples <= 0:
+                continue
+
+            self._pulls_since_poll += 1
+            yield TrackFrame(buffer=buffer, samples=samples)
             return
