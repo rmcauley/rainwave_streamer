@@ -59,6 +59,7 @@ class AudioPipeline:
         self._audio_track = audio_track
         self._use_realtime_wait = use_realtime_wait
         self._show_performance = show_performance
+        self.track_change_counter = 0
 
         try:
             self._encoders.append(
@@ -126,7 +127,6 @@ class AudioPipeline:
         self,
     ) -> None:
         current_track: TrackDecoder | None = None
-        track_change_counter = 0
         perf_timer = time.monotonic()
         try:
             (current_track, _) = self._get_next_track(get_start_buffer=False)
@@ -168,19 +168,18 @@ class AudioPipeline:
                 current_track = next_track
                 finished_track.close()
 
-                if self._show_performance and track_change_counter % 28 == 0:
+                if self._show_performance and self.track_change_counter > 100:
                     print("Perf: %.2f" % (time.monotonic() - perf_timer))
                     # I only need to see 1 sample for perf testing of the process.
                     # Anything after the first will just be noise.
                     self._show_performance = False
 
-                track_change_counter += 1
+                self.track_change_counter += 1
 
         finally:
             if current_track is not None:
                 current_track.close()
             self.close()
-            print(track_change_counter)
 
     def close(self) -> None:
         with self._close_lock:

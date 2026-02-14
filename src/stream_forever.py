@@ -45,7 +45,7 @@ async def stream_forever(
         process = psutil.Process()
         next_memory_log_at = 0.0
 
-    def log_memory_usage(force: bool = False) -> None:
+    def log_memory_usage(pipeline: AudioPipeline | None, force: bool = False) -> None:
         if process is None:
             return
 
@@ -65,8 +65,9 @@ async def stream_forever(
             return
 
         print(
-            "Memory usage: rss=%.1fMiB python_current=%.1fMiB python_peak=%.1fMiB threads=%d"
+            "Memory usage after %s songs: rss=%.1fMiB python_current=%.1fMiB python_peak=%.1fMiB threads=%d"
             % (
+                pipeline.track_change_counter if pipeline is not None else "???",
                 rss_bytes / bytes_per_mebibyte,
                 traced_current / bytes_per_mebibyte,
                 traced_peak / bytes_per_mebibyte,
@@ -136,7 +137,7 @@ async def stream_forever(
 
         while worker.is_alive():
             if show_performance:
-                log_memory_usage()
+                log_memory_usage(pipeline)
             if worker_error:
                 raise worker_error[0]
             await asyncio.sleep(1)
@@ -147,7 +148,7 @@ async def stream_forever(
         shutdown_requested.set()
         raise
     finally:
-        log_memory_usage(force=True)
+        log_memory_usage(pipeline, force=True)
         shutdown_requested.set()
 
         worker_stopped = worker is None
