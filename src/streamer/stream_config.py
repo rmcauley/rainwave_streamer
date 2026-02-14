@@ -15,8 +15,9 @@ layout = "stereo"
 # Length of crossfade, used to make sure our buffer sizes for samples
 # are at least this long.
 crossfade_seconds = 5
-# How long to look ahead to the song to check for silence
-lookahead_seconds = 10
+# Keep decoder lookahead at the crossfade window so we don't introduce
+# extra app-level buffering beyond what crossfade logic needs.
+lookahead_seconds = crossfade_seconds
 # Used to detect silence at the beginning and end of tracks
 silence_threshold_linear = math.pow(10.0, -60.0 / 20.0)
 

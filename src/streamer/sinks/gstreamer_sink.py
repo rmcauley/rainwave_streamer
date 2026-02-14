@@ -5,12 +5,18 @@ from typing import Any
 import gi
 
 from streamer.sinks.sink import AudioSink, AudioSinkError
-from streamer.stream_config import StreamConfig, SupportedFormats
+from streamer.stream_config import (
+    StreamConfig,
+    SupportedFormats,
+    mp3_bitrate_approx,
+    opus_bitrate_approx,
+)
 
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
-message_poll_interval_buffers = 64
+message_poll_interval_buffers = 16
+sink_buffer_target_ms = 250
 
 
 class GstreamerSink(AudioSink):
@@ -53,18 +59,29 @@ class GstreamerSink(AudioSink):
 
     def _build_pipeline(self) -> Any:
         pipeline = Gst.Pipeline.new(f"gstreamer-sink-{self._format}")
-        if pipeline is None:
-            raise AudioSinkError("Failed to create GStreamer sink pipeline.")
 
         appsrc = self._make_gst_element("appsrc", "src")
         queue = self._make_gst_element("queue", "queue")
         shout2send = self._make_gst_element("shout2send", "sink")
 
         caps = Gst.Caps.from_string(self._format_caps())
+        encoded_kbps = (
+            mp3_bitrate_approx if self._format == "mp3" else opus_bitrate_approx
+        )
+        encoded_bytes_per_second = int((encoded_kbps * 1000) / 8)
+        sink_buffer_target_seconds = sink_buffer_target_ms / 1000.0
+        encoded_max_bytes = max(
+            2048, int(encoded_bytes_per_second * sink_buffer_target_seconds)
+        )
         appsrc.set_property("caps", caps)
         appsrc.set_property("is-live", True)
         appsrc.set_property("format", Gst.Format.BYTES)
         appsrc.set_property("block", True)
+        appsrc.set_property("max-bytes", encoded_max_bytes)
+
+        queue.set_property("max-size-buffers", 0)
+        queue.set_property("max-size-bytes", encoded_max_bytes)
+        queue.set_property("max-size-time", int(sink_buffer_target_ms * 1_000_000))
 
         shout2send.set_property("ip", self._config.host)
         shout2send.set_property("port", self._config.port)

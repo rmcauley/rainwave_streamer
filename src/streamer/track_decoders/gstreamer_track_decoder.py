@@ -20,7 +20,8 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
-message_poll_interval_buffers = 64
+message_poll_interval_buffers = 16
+decoder_buffer_target_ms = 250
 
 
 class GstreamerTrackDecoder(TrackDecoder):
@@ -81,7 +82,13 @@ class GstreamerTrackDecoder(TrackDecoder):
         )
         capsfilter.set_property("caps", caps)
         appsink.set_property("sync", False)
-        appsink.set_property("max-buffers", 8)
+        raw_bytes_per_second = sample_rate * channels * 4
+        decoder_buffer_target_seconds = decoder_buffer_target_ms / 1000.0
+        appsink.set_property("max-buffers", 0)
+        appsink.set_property(
+            "max-bytes", int(raw_bytes_per_second * decoder_buffer_target_seconds)
+        )
+        appsink.set_property("max-time", int(decoder_buffer_target_ms * 1_000_000))
         appsink.set_property("drop", False)
         appsink.set_property("emit-signals", False)
 

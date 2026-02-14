@@ -22,7 +22,8 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
-message_poll_interval_buffers = 64
+message_poll_interval_buffers = 16
+encoder_buffer_target_ms = 250
 
 
 class GstreamerEncoderSender(EncoderSender):
@@ -60,9 +61,7 @@ class GstreamerEncoderSender(EncoderSender):
             self._appsink = self._get_required_element("sink")
             self._bus = self._pipeline.get_bus()
             if self._bus is None:
-                raise EncoderSenderEncodeError(
-                    "Failed to get GStreamer encoder bus."
-                )
+                raise EncoderSenderEncodeError("Failed to get GStreamer encoder bus.")
 
             state_result = self._pipeline.set_state(Gst.State.PLAYING)
             if state_result == Gst.StateChangeReturn.FAILURE:
@@ -143,32 +142,38 @@ class GstreamerEncoderSender(EncoderSender):
 
     def _build_pipeline(self, format: SupportedFormats) -> Any:
         pipeline = Gst.Pipeline.new(f"gstreamer-encoder-{format}")
-        if pipeline is None:
-            raise EncoderSenderEncodeError(
-                "Failed to create GStreamer encoder pipeline."
-            )
 
         appsrc = self._make_gst_element("appsrc", "src")
         audioconvert = self._make_gst_element("audioconvert", "convert")
-        audioresample = self._make_gst_element("audioresample", "resample")
         appsink = self._make_gst_element("appsink", "sink")
 
         caps = Gst.Caps.from_string(
             f"audio/x-raw,format=F32LE,channels={channels},rate={sample_rate},layout=interleaved"
+        )
+        raw_bytes_per_second = sample_rate * channels * 4
+        encoder_buffer_target_seconds = encoder_buffer_target_ms / 1000.0
+        encoded_kbps = mp3_bitrate_approx if format == "mp3" else opus_bitrate_approx
+        encoded_bytes_per_second = int((encoded_kbps * 1000) / 8)
+        encoded_max_bytes = max(
+            2048, int(encoded_bytes_per_second * encoder_buffer_target_seconds)
         )
         appsrc.set_property("caps", caps)
         appsrc.set_property("is-live", True)
         appsrc.set_property("format", Gst.Format.TIME)
         appsrc.set_property("block", True)
         appsrc.set_property("do-timestamp", True)
+        appsrc.set_property(
+            "max-bytes", int(raw_bytes_per_second * encoder_buffer_target_seconds)
+        )
         appsink.set_property("sync", False)
-        appsink.set_property("max-buffers", 16)
+        appsink.set_property("max-buffers", 0)
+        appsink.set_property("max-bytes", encoded_max_bytes)
+        appsink.set_property("max-time", int(encoder_buffer_target_ms * 1_000_000))
         appsink.set_property("drop", False)
         appsink.set_property("emit-signals", False)
 
         pipeline.add(appsrc)
         pipeline.add(audioconvert)
-        pipeline.add(audioresample)
         pipeline.add(appsink)
 
         if format == "mp3":
@@ -180,13 +185,9 @@ class GstreamerEncoderSender(EncoderSender):
 
             if not appsrc.link(audioconvert):
                 raise EncoderSenderEncodeError("Failed to link appsrc -> audioconvert.")
-            if not audioconvert.link(audioresample):
+            if not audioconvert.link(encoder):
                 raise EncoderSenderEncodeError(
-                    "Failed to link audioconvert -> audioresample."
-                )
-            if not audioresample.link(encoder):
-                raise EncoderSenderEncodeError(
-                    "Failed to link audioresample -> lamemp3enc."
+                    "Failed to link audioconvert -> lamemp3enc."
                 )
             if not encoder.link(appsink):
                 raise EncoderSenderEncodeError("Failed to link lamemp3enc -> appsink.")
@@ -204,12 +205,8 @@ class GstreamerEncoderSender(EncoderSender):
 
         if not appsrc.link(audioconvert):
             raise EncoderSenderEncodeError("Failed to link appsrc -> audioconvert.")
-        if not audioconvert.link(audioresample):
-            raise EncoderSenderEncodeError(
-                "Failed to link audioconvert -> audioresample."
-            )
-        if not audioresample.link(encoder):
-            raise EncoderSenderEncodeError("Failed to link audioresample -> opusenc.")
+        if not audioconvert.link(encoder):
+            raise EncoderSenderEncodeError("Failed to link audioconvert -> opusenc.")
         if not encoder.link(muxer):
             raise EncoderSenderEncodeError("Failed to link opusenc -> oggmux.")
         if not muxer.link(appsink):
