@@ -4,6 +4,7 @@ import logging
 import sys
 from typing import Sequence
 
+import cache
 from streamer.encoder_senders.gstreamer_encoder import GstreamerEncoderSender
 from streamer.sinks.gstreamer_sink import GstreamerSink
 from streamer.sinks.null_sink import NullSink
@@ -41,8 +42,10 @@ def _build_null_stream_config(sid: int) -> StreamConfig:
     )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+async def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
+
+    await cache.connect()
 
     logging.basicConfig(
         level=logging.ERROR if args.perftest else logging.DEBUG,
