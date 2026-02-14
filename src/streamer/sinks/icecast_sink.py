@@ -3,14 +3,14 @@ from threading import Event, Lock, Thread
 
 import shout
 
-from streamer.connectors.connection import (
-    AudioServerConnection,
-    AudioServerConnectionError,
+from streamer.sinks.sink import (
+    AudioSink,
+    AudioSinkError,
 )
 from streamer.stream_config import StreamConfig, SupportedFormats, sample_rate, channels
 
 
-class IcecastConnection(AudioServerConnection):
+class IcecastSink(AudioSink):
     def __init__(self, config: StreamConfig, format: SupportedFormats) -> None:
         super().__init__(config, format)
 
@@ -49,7 +49,7 @@ class IcecastConnection(AudioServerConnection):
         try:
             conn.open()
         except Exception as e:
-            raise AudioServerConnectionError(
+            raise AudioSinkError(
                 f"Failed opening Icecast connection for {self.mount_path}: {e}"
             ) from e
         return conn
@@ -62,16 +62,14 @@ class IcecastConnection(AudioServerConnection):
             with self._conn_lock:
                 conn = self._conn
             if conn is None:
-                raise AudioServerConnectionError(
-                    f"Icecast connection {self.mount_path} is closed."
-                )
+                raise AudioSinkError(f"Icecast connection {self.mount_path} is closed.")
 
             try:
                 conn.send(data)
                 return
             except Exception as send_error:
                 if self._closed_event.is_set():
-                    raise AudioServerConnectionError(
+                    raise AudioSinkError(
                         f"Failed sending packet to {self.mount_path}: connection closed."
                     ) from send_error
                 logging.warning(
@@ -81,20 +79,20 @@ class IcecastConnection(AudioServerConnection):
                 )
                 try:
                     if not self._reconnect_with_shutdown_support():
-                        raise AudioServerConnectionError(
+                        raise AudioSinkError(
                             f"Failed sending packet to {self.mount_path}: connection closed."
                         ) from send_error
                     logging.info("Reconnected to Icecast mount %s.", self.mount_path)
                     # Re-attempt send immediately after a successful reconnect.
                     continue
-                except AudioServerConnectionError as reconnect_error:
+                except AudioSinkError as reconnect_error:
                     logging.warning(
                         "Reconnect failed for %s, will retry: %s",
                         self.mount_path,
                         reconnect_error,
                     )
                 if self._closed_event.wait(timeout=retry_delay_seconds):
-                    raise AudioServerConnectionError(
+                    raise AudioSinkError(
                         f"Failed sending packet to {self.mount_path}: connection closed."
                     ) from send_error
 
@@ -131,9 +129,9 @@ class IcecastConnection(AudioServerConnection):
             reconnect_error = self._reconnect_error
 
         if reconnect_error is not None:
-            if isinstance(reconnect_error, AudioServerConnectionError):
+            if isinstance(reconnect_error, AudioSinkError):
                 raise reconnect_error
-            raise AudioServerConnectionError(
+            raise AudioSinkError(
                 f"Unexpected reconnect error for {self.mount_path}: {reconnect_error}"
             ) from reconnect_error
         return True

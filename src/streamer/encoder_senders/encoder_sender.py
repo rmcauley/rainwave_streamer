@@ -1,9 +1,9 @@
 from abc import abstractmethod
 import numpy as np
 
-from streamer.connectors.connection import (
-    AudioServerConnection,
-    AudioServerConnectionConstructor,
+from streamer.sinks.sink import (
+    AudioSink,
+    AudioSinkConstructor,
 )
 from streamer.stream_config import ShouldStopFn, StreamConfig, SupportedFormats
 
@@ -23,14 +23,14 @@ class EncoderSenderSendError(Exception):
 class EncoderSender:
     _config: StreamConfig
     _format: SupportedFormats
-    _conn: AudioServerConnection
+    _conn: AudioSink
     _should_stop: ShouldStopFn
 
     def __init__(
         self,
         config: StreamConfig,
         format: SupportedFormats,
-        connector: AudioServerConnectionConstructor,
+        connector: AudioSinkConstructor,
         should_stop: ShouldStopFn,
     ) -> None:
         self._config = config

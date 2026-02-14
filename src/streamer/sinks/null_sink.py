@@ -1,13 +1,13 @@
 from threading import Lock
 
-from streamer.connectors.connection import (
-    AudioServerConnection,
-    AudioServerConnectionError,
+from streamer.sinks.sink import (
+    AudioSink,
+    AudioSinkError,
 )
 from streamer.stream_config import StreamConfig, SupportedFormats
 
 
-class NullSinkConnection(AudioServerConnection):
+class NullSink(AudioSink):
     """
     AudioServerConnection implementation that discards encoded bytes.
     """
@@ -23,7 +23,7 @@ class NullSinkConnection(AudioServerConnection):
             return
         with self._lock:
             if self._closed:
-                raise AudioServerConnectionError(
+                raise AudioSinkError(
                     f"Null sink connection {self.mount_path} is closed."
                 )
             self._bytes_sent += len(data)
@@ -31,7 +31,7 @@ class NullSinkConnection(AudioServerConnection):
     def reconnect(self) -> None:
         with self._lock:
             if self._closed:
-                raise AudioServerConnectionError(
+                raise AudioSinkError(
                     f"Null sink connection {self.mount_path} is closed."
                 )
             return

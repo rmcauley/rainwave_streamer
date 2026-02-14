@@ -4,11 +4,11 @@ from typing import Any, Iterator
 
 import numpy as np
 
-from streamer.decoders.audio_track import (
-    AudioTrack,
-    AudioTrackDecodeError,
-    AudioTrackNoMoreFramesError,
-    AudioTrackOpenError,
+from streamer.track_decoders.track_decoder import (
+    TrackDecoder,
+    TrackDecodeError,
+    TrackNoMoreFramesError,
+    TrackOpenError,
 )
 from streamer.stream_config import (
     sample_rate,
@@ -22,7 +22,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
 
-class GstreamerAudioTrack(AudioTrack):
+class GstreamerTrackDecoder(TrackDecoder):
     _pipeline: Any
     _appsink: Any
     _bus: Any
@@ -41,18 +41,18 @@ class GstreamerAudioTrack(AudioTrack):
 
             state_result = self._pipeline.set_state(Gst.State.PLAYING)
             if state_result == Gst.StateChangeReturn.FAILURE:
-                raise AudioTrackOpenError(
+                raise TrackOpenError(
                     self.path, "Failed to set GStreamer pipeline to PLAYING."
                 )
         except Exception as e:
             self.close()
             logging.error(f"Failed to open track {self.path}: {e}")
-            raise AudioTrackOpenError(self.path) from e
+            raise TrackOpenError(self.path) from e
 
     def _make_gst_element(self, element_name: str, instance_name: str) -> Any:
         element = Gst.ElementFactory.make(element_name, instance_name)
         if element is None:
-            raise AudioTrackOpenError(
+            raise TrackOpenError(
                 self.path,
                 f"GStreamer element '{element_name}' was not found. Check plugin installation.",
             )
@@ -85,19 +85,17 @@ class GstreamerAudioTrack(AudioTrack):
         pipeline.add(appsink)
 
         if not filesrc.link(decodebin):
-            raise AudioTrackOpenError(self.path, "Failed to link filesrc -> decodebin.")
+            raise TrackOpenError(self.path, "Failed to link filesrc -> decodebin.")
         if not audioconvert.link(audioresample):
-            raise AudioTrackOpenError(
+            raise TrackOpenError(
                 self.path, "Failed to link audioconvert -> audioresample."
             )
         if not audioresample.link(capsfilter):
-            raise AudioTrackOpenError(
+            raise TrackOpenError(
                 self.path, "Failed to link audioresample -> capsfilter."
             )
         if not capsfilter.link(appsink):
-            raise AudioTrackOpenError(
-                self.path, "Failed to link capsfilter -> appsink."
-            )
+            raise TrackOpenError(self.path, "Failed to link capsfilter -> appsink.")
 
         decodebin.connect("pad-added", self._on_decodebin_pad_added, audioconvert)
         bus = pipeline.get_bus()
@@ -156,7 +154,7 @@ class GstreamerAudioTrack(AudioTrack):
                 self.path,
                 e,
             )
-            raise AudioTrackDecodeError(self.path) from e
+            raise TrackDecodeError(self.path) from e
 
         return start_buffer
 
@@ -172,7 +170,7 @@ class GstreamerAudioTrack(AudioTrack):
 
             if msg.type == Gst.MessageType.ERROR:
                 err, debug = msg.parse_error()
-                raise AudioTrackDecodeError(
+                raise TrackDecodeError(
                     self.path, f"GStreamer decode error: {err} (debug: {debug})"
                 )
             if msg.type == Gst.MessageType.EOS:
@@ -185,7 +183,7 @@ class GstreamerAudioTrack(AudioTrack):
 
         success, map_info = buffer.map(Gst.MapFlags.READ)
         if not success:
-            raise AudioTrackDecodeError(self.path, "Failed to map decoded PCM buffer.")
+            raise TrackDecodeError(self.path, "Failed to map decoded PCM buffer.")
 
         try:
             interleaved = np.frombuffer(map_info.data, dtype=np.float32)
@@ -211,12 +209,12 @@ class GstreamerAudioTrack(AudioTrack):
         while True:
             self._poll_gst_messages()
             if self._eos:
-                raise AudioTrackNoMoreFramesError()
+                raise TrackNoMoreFramesError()
 
             sample = self._appsink.emit("pull-sample")
             if sample is None:
                 self._poll_gst_messages()
-                raise AudioTrackNoMoreFramesError()
+                raise TrackNoMoreFramesError()
 
             frame = self._sample_to_frame(sample)
             if frame.shape[1] <= 0:

@@ -5,7 +5,7 @@ from threading import Lock, Thread
 import subprocess
 from typing import Literal
 
-from streamer.connectors.connection import AudioServerConnectionConstructor
+from streamer.sinks.sink import AudioSinkConstructor
 from streamer.encoder_senders.encoder_sender import (
     EncoderSender,
     EncoderSenderEncodeError,
@@ -35,7 +35,7 @@ class SubprocessEncoderSender(EncoderSender):
         self,
         config: StreamConfig,
         format: SupportedFormats,
-        connector: AudioServerConnectionConstructor,
+        connector: AudioSinkConstructor,
         should_stop: ShouldStopFn,
     ) -> None:
         super().__init__(config, format, connector, should_stop)

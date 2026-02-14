@@ -1,6 +1,6 @@
 import numpy as np
-from streamer.connectors.connection import (
-    AudioServerConnectionConstructor,
+from streamer.sinks.sink import (
+    AudioSinkConstructor,
 )
 from streamer.encoder_senders.encoder_sender import EncoderSender
 from streamer.stream_config import ShouldStopFn, StreamConfig, SupportedFormats
@@ -11,7 +11,7 @@ class GstreamerEncoderSender(EncoderSender):
         self,
         config: StreamConfig,
         format: SupportedFormats,
-        connector: AudioServerConnectionConstructor,
+        connector: AudioSinkConstructor,
         should_stop: ShouldStopFn,
     ) -> None:
         super().__init__(config, format, connector, should_stop)

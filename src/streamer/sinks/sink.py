@@ -3,11 +3,11 @@ from abc import abstractmethod
 from streamer.stream_config import StreamConfig, SupportedFormats
 
 
-class AudioServerConnectionError(Exception):
+class AudioSinkError(Exception):
     pass
 
 
-class AudioServerConnection:
+class AudioSink:
     _config: StreamConfig
     _format: SupportedFormats
     mount_path: str
@@ -30,4 +30,4 @@ class AudioServerConnection:
         raise NotImplementedError()
 
 
-AudioServerConnectionConstructor = type[AudioServerConnection]
+AudioSinkConstructor = type[AudioSink]

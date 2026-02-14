@@ -6,15 +6,15 @@ from typing import Iterator
 
 import numpy as np
 
-from streamer.decoders.audio_track import (
-    AudioTrack,
-    AudioTrackConstructor,
-    AudioTrackDecodeError,
-    AudioTrackEOFError,
-    AudioTrackOpenError,
+from streamer.track_decoders.track_decoder import (
+    TrackDecoder,
+    AudioTrackDecoderConstructor,
+    TrackDecodeError,
+    TrackEOFError,
+    TrackOpenError,
 )
-from streamer.connectors.connection import (
-    AudioServerConnectionConstructor,
+from streamer.sinks.sink import (
+    AudioSinkConstructor,
 )
 from streamer.encoder_senders.encoder_sender import (
     EncoderSender,
@@ -48,9 +48,9 @@ class AudioPipeline:
     def __init__(
         self,
         config: StreamConfig,
-        server_connector: AudioServerConnectionConstructor,
+        server_connector: AudioSinkConstructor,
         encoder_sender: EncoderSenderConstructor,
-        audio_track: AudioTrackConstructor,
+        audio_track: AudioTrackDecoderConstructor,
         get_next_track_from_rainwave: GetNextTrackFromRainwaveBlockingFn,
         mark_track_invalid_on_rainwave: MarkTrackInvalidOnRainwaveFireAndForgetFn,
         should_stop: ShouldStopFn,
@@ -96,7 +96,7 @@ class AudioPipeline:
             raise AudioPipelineGracefulShutdownError()
 
     def _handle_invalid_next_track(self, exc: Exception) -> None:
-        if isinstance(exc, (AudioTrackDecodeError, AudioTrackOpenError)):
+        if isinstance(exc, (TrackDecodeError, TrackOpenError)):
             logging.error(
                 "Decode failed for track %s; marking invalid",
                 exc.path,
@@ -111,7 +111,7 @@ class AudioPipeline:
 
     def _get_next_track(
         self, get_start_buffer: bool = True
-    ) -> tuple[AudioTrack, deque[np.ndarray]]:
+    ) -> tuple[TrackDecoder, deque[np.ndarray]]:
         # Attempt to fetch from Rainwave's backend continually until Rainwave responds.
         while True:
             self._raise_if_shutting_down()
@@ -124,7 +124,7 @@ class AudioPipeline:
                 )
                 logging.info(f"Next song queued: {next_track_info.path}")
                 return (next_track, next_track_start_buffer)
-            except (AudioTrackDecodeError, AudioTrackOpenError) as e:
+            except (TrackDecodeError, TrackOpenError) as e:
                 self._handle_invalid_next_track(e)
                 # Wait 2 seconds before trying to fetch again from Rainwave's backend
                 self._wait_for_retry_or_shutdown(2.0)
@@ -133,7 +133,7 @@ class AudioPipeline:
     def stream_tracks(
         self,
     ) -> None:
-        current_track: AudioTrack | None = None
+        current_track: TrackDecoder | None = None
         try:
             (current_track, _) = self._get_next_track(get_start_buffer=False)
 
@@ -144,9 +144,9 @@ class AudioPipeline:
                 try:
                     for frame in current_track.get_frames():
                         self._encode_frame(frame, realtime_wait=True)
-                except AudioTrackEOFError:
+                except TrackEOFError:
                     pass
-                except AudioTrackDecodeError as e:
+                except TrackDecodeError as e:
                     self._handle_invalid_next_track(e)
                     # Clearing the audio buffer here will cause the crossfade check to be skipped
                     # since the resulting frames deque will be 0-length.

@@ -3,9 +3,9 @@ import queue
 from collections.abc import Callable
 from threading import Condition, Event, Thread
 
-from streamer.connectors.connection import (
-    AudioServerConnection,
-    AudioServerConnectionError,
+from streamer.sinks.sink import (
+    AudioSink,
+    AudioSinkError,
 )
 
 
@@ -17,7 +17,7 @@ class ThreadedSender:
 
     def __init__(
         self,
-        conn: AudioServerConnection,
+        conn: AudioSink,
         max_buffer_bytes: int = 64 * 1024,
         should_stop: Callable[[], bool] = lambda: False,
     ) -> None:
@@ -45,7 +45,7 @@ class ThreadedSender:
                 self._conn.send(data)
             except queue.Empty:
                 continue
-            except AudioServerConnectionError as send_error:
+            except AudioSinkError as send_error:
                 if self._stop_event.is_set():
                     break
                 logging.error(

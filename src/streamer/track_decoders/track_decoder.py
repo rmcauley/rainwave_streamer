@@ -17,16 +17,16 @@ from streamer.stream_config import (
 
 # Used to signal to the audio pipeline that the track is finished
 # and is ready for crossfade.
-class AudioTrackEOFError(Exception):
+class TrackEOFError(Exception):
     pass
 
 
 # Used internally to signal that decode has reached end-of-file.
-class AudioTrackNoMoreFramesError(Exception):
+class TrackNoMoreFramesError(Exception):
     pass
 
 
-class AudioTrackOpenError(Exception):
+class TrackOpenError(Exception):
     path: str
 
     def __init__(self, path: str, *args: object):
@@ -34,7 +34,7 @@ class AudioTrackOpenError(Exception):
         self.path = path
 
 
-class AudioTrackDecodeError(Exception):
+class TrackDecodeError(Exception):
     path: str
 
     def __init__(self, path: str, *args: object):
@@ -43,12 +43,12 @@ class AudioTrackDecodeError(Exception):
 
 
 @dataclass(frozen=True)
-class AudioTrackInfo:
+class TrackInfo:
     path: str
     gain_db: float
 
 
-class AudioTrack:
+class TrackDecoder:
     path: str
     _gain_db: float
     _linear_gain: np.float32
@@ -59,7 +59,7 @@ class AudioTrack:
     audio_buffer: deque[np.ndarray]
     audio_buffer_samples: int
 
-    def __init__(self, track_info: AudioTrackInfo) -> None:
+    def __init__(self, track_info: TrackInfo) -> None:
         logging.info(f"Opening track: {track_info.path}")
         self.path = track_info.path
         self._gain_db = track_info.gain_db
@@ -74,7 +74,7 @@ class AudioTrack:
         except Exception as e:
             self.close()
             logging.error(f"Failed to open track {track_info.path}: {e}")
-            raise AudioTrackOpenError(self.path) from e
+            raise TrackOpenError(self.path) from e
 
     @abstractmethod
     def _open_stream(self) -> None:
@@ -137,11 +137,11 @@ class AudioTrack:
                     yield_frame = self.audio_buffer.popleft()
                     self.audio_buffer_samples -= yield_frame.shape[1]
                     yield yield_frame
-        except AudioTrackNoMoreFramesError:
+        except TrackNoMoreFramesError:
             logging.debug(f"Finished decoding {self.path}")
         except Exception as e:
             logging.error(f"Error decoding {self.path}: {e}")
-            raise AudioTrackDecodeError(self.path) from e
+            raise TrackDecodeError(self.path) from e
 
         self._trim_trailing_silence()
 
@@ -150,7 +150,7 @@ class AudioTrack:
             self.audio_buffer_samples -= yield_frame.shape[1]
             yield yield_frame
 
-        raise AudioTrackEOFError()
+        raise TrackEOFError()
 
 
-AudioTrackConstructor = type[AudioTrack]
+AudioTrackDecoderConstructor = type[TrackDecoder]

@@ -1,7 +1,7 @@
-from streamer.decoders.audio_track import AudioTrackInfo
+from streamer.track_decoders.track_decoder import TrackInfo
 from collections.abc import Callable
 
-type GetNextTrackFromRainwaveBlockingFn = Callable[[], AudioTrackInfo]
+type GetNextTrackFromRainwaveBlockingFn = Callable[[], TrackInfo]
 type MarkTrackInvalidOnRainwaveFireAndForgetFn = Callable[[str], None]
 
 tracks = [
@@ -12,10 +12,10 @@ tracks = [
 ]
 
 
-async def get_next_track_from_rainwave() -> AudioTrackInfo:
+async def get_next_track_from_rainwave() -> TrackInfo:
     path = tracks.pop(0)
     tracks.append(path)
-    return AudioTrackInfo(
+    return TrackInfo(
         path=f"/mnt/e/Music - VGM/Mega Man X1 (Boxset OST)/{path}",
         gain_db=-6.27,
     )
