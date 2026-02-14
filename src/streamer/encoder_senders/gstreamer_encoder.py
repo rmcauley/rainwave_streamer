@@ -189,6 +189,7 @@ class GstreamerEncoderSender(EncoderSender):
 
         if format == "mp3":
             encoder = self._make_gst_element("lamemp3enc", "encoder")
+            self._disable_tag_metadata(encoder)
             encoder.set_property("target", "quality")
             encoder.set_property("quality", 7.0)
             encoder.set_property("bitrate", mp3_bitrate_approx)

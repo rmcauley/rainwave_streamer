@@ -97,6 +97,8 @@ class GstreamerSink(AudioSink):
         shout2send.set_property("public", False)
         shout2send.set_property("protocol", "http")
         shout2send.set_property("sync", False)
+        if self._format == "mp3":
+            shout2send.set_property("send-title-info", False)
 
         pipeline.add(appsrc)
         pipeline.add(queue)
