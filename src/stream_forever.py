@@ -81,7 +81,9 @@ async def stream_forever(
     def next_track_blocking() -> TrackInfo:
         if should_stop_workers():
             raise AudioPipelineGracefulShutdownError()
-        future = asyncio.run_coroutine_threadsafe(get_next_track_from_rainwave(), loop)
+        future = asyncio.run_coroutine_threadsafe(
+            get_next_track_from_rainwave(config.sid), loop
+        )
         try:
             track_info = future.result(timeout=2.0)
             return track_info

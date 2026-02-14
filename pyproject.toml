@@ -10,6 +10,7 @@ dependencies = [
     "types-psutil==7.2.2.20260130",
     "pygobject==3.54.5",
     "pygobject-stubs==2.16.0",
+    "emcache>=1.3.3",
 ]
 
 [build-system]

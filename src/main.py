@@ -27,7 +27,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _build_null_stream_config() -> StreamConfig:
+def _build_null_stream_config(sid: int) -> StreamConfig:
     return StreamConfig(
         description="Local sink test; no Icecast connection.",
         genre="Test",
@@ -37,6 +37,7 @@ def _build_null_stream_config() -> StreamConfig:
         port=8000,
         stream_filename="null_sink",
         url="http://localhost/null_sink",
+        sid=sid,
     )
 
 
@@ -60,7 +61,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise Exception("No relay config found in config.py")
 
     stream_config = (
-        _build_null_stream_config()
+        _build_null_stream_config(sid)
         if args.perftest
         else StreamConfig(
             host=relay_config["ip_address"],
@@ -71,6 +72,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             description=station_config["description"],
             genre="Game",
             url=f"http://rainwave.cc/{station_config['stream_filename']}",
+            sid=sid,
         )
     )
     try:

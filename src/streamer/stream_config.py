@@ -32,3 +32,4 @@ class StreamConfig:
     port: int
     stream_filename: str
     url: str
+    sid: int

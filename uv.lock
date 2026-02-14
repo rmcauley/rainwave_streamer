@@ -46,6 +46,15 @@ wheels = [
 ]
 
 [[package]]
+name = "emcache"
+version = "1.3.3"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/21/04/f22168f085fc9eb3fa0625d74037c43f1fb715d45b1d9607aa525b3eabe8/emcache-1.3.3-cp314-cp314-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:b5148b3064dcbad882e86c916f8f7c305a1780b51b2621bc951ed255d7185654", size = 274560, upload-time = "2026-01-09T09:39:49.034Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/cb/d5ffffd1c408e4e1a73bda78468f71fe9620f6685b72a5c19488e23a529b/emcache-1.3.3-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ef67736580b621bc14d8f5c90344edaf96f786c5a939f4af91b3176e3fa71924", size = 282044, upload-time = "2026-01-09T09:39:50.226Z" },
+]
+
+[[package]]
 name = "librt"
 version = "0.7.8"
 source = { registry = "https://pypi.org/simple" }
@@ -238,6 +247,7 @@ name = "rainwave-streamer"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [
+    { name = "emcache" },
     { name = "numpy" },
     { name = "psutil" },
     { name = "pygobject" },
@@ -253,6 +263,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "emcache", specifier = ">=1.3.3" },
     { name = "numpy", specifier = "==2.4.2" },
     { name = "psutil", specifier = "==7.2.2" },
     { name = "pygobject", specifier = "==3.54.5" },
