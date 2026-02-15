@@ -1,10 +1,12 @@
 import logging
-from threading import Lock, Thread
 import subprocess
 from collections import deque
+from threading import Lock, Thread
 from typing import Any, Literal
+from urllib.parse import quote
 
 from streamer.sinks.sink import AudioSinkConstructor
+from streamer.sinks.null_sink import NullSink
 from streamer.encoder_senders.encoder_sender import (
     EncoderSender,
     EncoderSenderEncodeError,
@@ -27,13 +29,16 @@ from gi.repository import Gst
 class FfmpegSubprocessEncoderSender(EncoderSender):
     _codec_name: Literal["mp3", "opus"]
     _process: subprocess.Popen[bytes]
-    _stdout_thread: Thread
-    _stderr_thread: Thread
+    _stdout_thread: Thread | None
+    _stderr_thread: Thread | None
+    _pipe_output: bool
+    _mount_path: str
     _closed: bool
     _close_lock: Lock
     _stderr_tail: deque[str]
     _worker_error: Exception | None
     _worker_error_lock: Lock
+    _conn: Any
 
     def __init__(
         self,
@@ -42,27 +47,34 @@ class FfmpegSubprocessEncoderSender(EncoderSender):
         connector: AudioSinkConstructor,
         should_stop: ShouldStopFn,
     ) -> None:
-        super().__init__(config, format, connector, should_stop)
-
+        self._config = config
+        self._format = format
+        self._should_stop = should_stop
+        self._mount_path = f"{config.stream_filename}.{format}"
         self._codec_name = "mp3" if format == "mp3" else "opus"
+        self._pipe_output = connector is NullSink
+        self._conn = connector(config, format) if self._pipe_output else None
         self._closed = False
         self._close_lock = Lock()
         self._stderr_tail = deque(maxlen=20)
         self._worker_error = None
         self._worker_error_lock = Lock()
+        self._stdout_thread = None
+        self._stderr_thread = None
         try:
             self._process = self._start_ffmpeg_process(self._codec_name)
-            self._stdout_thread = Thread(
-                target=self._stdout_worker,
-                daemon=True,
-                name=f"FfmpegStdout-{format}-{self._conn.mount_path}",
-            )
+            if self._pipe_output:
+                self._stdout_thread = Thread(
+                    target=self._stdout_worker,
+                    daemon=True,
+                    name=f"FfmpegStdout-{format}-{self._mount_path}",
+                )
+                self._stdout_thread.start()
             self._stderr_thread = Thread(
                 target=self._stderr_worker,
                 daemon=True,
-                name=f"FfmpegStderr-{format}-{self._conn.mount_path}",
+                name=f"FfmpegStderr-{format}-{self._mount_path}",
             )
-            self._stdout_thread.start()
             self._stderr_thread.start()
         except Exception:
             process = getattr(self, "_process", None)
@@ -71,8 +83,18 @@ class FfmpegSubprocessEncoderSender(EncoderSender):
                     process.kill()
                 except Exception:
                     pass
-            self._conn.close()
+            if self._conn is not None:
+                self._conn.close()
             raise
+
+    def _build_icecast_url(self) -> str:
+        host = self._config.host
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+
+        mount = self._mount_path.lstrip("/")
+        encoded_mount = quote(mount, safe="/")
+        return f"icecast://source@{host}:{self._config.port}/{encoded_mount}"
 
     def _start_ffmpeg_process(
         self, codec_name: Literal["mp3", "opus"]
@@ -95,6 +117,9 @@ class FfmpegSubprocessEncoderSender(EncoderSender):
             "-1",
         ]
 
+        output_format = "mp3" if codec_name == "mp3" else "ogg"
+        content_type = "audio/mpeg" if codec_name == "mp3" else "application/ogg"
+
         if codec_name == "mp3":
             cmd.extend(
                 [
@@ -104,9 +129,6 @@ class FfmpegSubprocessEncoderSender(EncoderSender):
                     "7",
                     "-b:a",
                     f"{mp3_bitrate_approx}k",
-                    "-f",
-                    "mp3",
-                    "pipe:1",
                 ]
             )
         else:
@@ -120,9 +142,37 @@ class FfmpegSubprocessEncoderSender(EncoderSender):
                     "on",
                     "-application",
                     "audio",
-                    "-f",
-                    "ogg",
-                    "pipe:1",
+                    "-frame_duration",
+                    "20",
+                    "-compression_level",
+                    "10",
+                    "-cutoff",
+                    "20000",
+                ]
+            )
+
+        cmd.extend(["-f", output_format])
+
+        if self._pipe_output:
+            cmd.append("pipe:1")
+        else:
+            cmd.extend(
+                [
+                    "-content_type",
+                    content_type,
+                    "-ice_name",
+                    self._config.name,
+                    "-ice_description",
+                    self._config.description,
+                    "-ice_genre",
+                    self._config.genre,
+                    "-ice_url",
+                    self._config.url,
+                    "-ice_public",
+                    "0",
+                    "-password",
+                    self._config.password,
+                    self._build_icecast_url(),
                 ]
             )
 
@@ -130,7 +180,7 @@ class FfmpegSubprocessEncoderSender(EncoderSender):
             process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.PIPE if self._pipe_output else subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 bufsize=0,
             )
@@ -139,9 +189,12 @@ class FfmpegSubprocessEncoderSender(EncoderSender):
                 "ffmpeg executable not found. Is ffmpeg installed and in PATH?"
             ) from e
 
-        if process.stdin is None or process.stdout is None or process.stderr is None:
+        if process.stdin is None or process.stderr is None:
             process.kill()
             raise EncoderSenderEncodeError("ffmpeg pipes were not created.")
+        if self._pipe_output and process.stdout is None:
+            process.kill()
+            raise EncoderSenderEncodeError("ffmpeg stdout pipe was not created.")
         return process
 
     def _set_worker_error(self, error: Exception) -> None:
@@ -167,6 +220,9 @@ class FfmpegSubprocessEncoderSender(EncoderSender):
         return out_buffer
 
     def _stdout_worker(self) -> None:
+        conn = self._conn
+        if conn is None:
+            return
         stdout = self._process.stdout
         if stdout is None:
             return
@@ -175,7 +231,7 @@ class FfmpegSubprocessEncoderSender(EncoderSender):
                 data = stdout.read(65536)
                 if not data:
                     break
-                self._conn.send(self._bytes_to_gst_buffer(data))
+                conn.send(self._bytes_to_gst_buffer(data))
         except Exception as e:
             self._set_worker_error(e)
             logging.error("ffmpeg %s stdout worker failed: %s", self._codec_name, e)
@@ -255,7 +311,8 @@ class FfmpegSubprocessEncoderSender(EncoderSender):
 
         process = getattr(self, "_process", None)
         if process is None:
-            self._conn.close()
+            if self._conn is not None:
+                self._conn.close()
             return
 
         try:
@@ -289,4 +346,5 @@ class FfmpegSubprocessEncoderSender(EncoderSender):
             if stderr_thread.is_alive():
                 logging.error("ffmpeg %s stderr thread did not stop.", self._codec_name)
 
-        self._conn.close()
+        if self._conn is not None:
+            self._conn.close()
