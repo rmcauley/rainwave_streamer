@@ -3,6 +3,7 @@ import logging
 import time
 import tracemalloc
 from concurrent.futures import Future
+from http.client import HTTPConnection
 from threading import Event, Thread
 
 import psutil
@@ -22,6 +23,28 @@ from streamer.stream_config import StreamConfig
 memory_log_interval_seconds = 30.0
 bytes_per_mebibyte = 1024 * 1024
 tracemalloc_frames = 25
+
+
+def probe_stream_server_root(config: StreamConfig) -> None:
+    conn: HTTPConnection | None = None
+    try:
+        conn = HTTPConnection(config.host, config.port, timeout=2)
+        conn.request("GET", "/")
+        result = conn.getresponse()
+        logging.debug(
+            "Stream server startup probe response: %s for http://%s:%s/",
+            result.status,
+            config.host,
+            config.port,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "Error probing stream server root URL "
+            f"http://{config.host}:{config.port}/"
+        ) from e
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 async def stream_forever(
@@ -121,6 +144,9 @@ async def stream_forever(
             shutdown_requested.set()
 
     try:
+        if not performance_test:
+            probe_stream_server_root(config)
+
         first_track = await get_next_track_from_rainwave(config.sid)
 
         pipeline = AudioPipeline(
