@@ -15,7 +15,6 @@ from streamer.track_decoders.track_decoder import (
 )
 from streamer.get_next_track_from_rainwave import (
     get_next_track_from_rainwave,
-    get_next_track_from_robs_ssd,
     mark_track_invalid_on_rainwave,
 )
 from streamer.stream_config import StreamConfig
@@ -80,8 +79,7 @@ async def stream_forever(
         if should_stop_workers():
             raise AudioPipelineGracefulShutdownError()
         future = asyncio.run_coroutine_threadsafe(
-            (get_next_track_from_robs_ssd()),
-            loop,
+            get_next_track_from_rainwave(config.sid), loop
         )
         try:
             track_info = future.result(timeout=2.0)
