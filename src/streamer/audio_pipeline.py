@@ -19,8 +19,11 @@ from streamer.sinks.sink import (
 )
 from streamer.encoder_senders.encoder_sender import (
     EncoderSender,
-    EncoderSenderConstructor,
 )
+from streamer.encoder_senders.ffmpeg_subprocess_encoder import (
+    FfmpegSubprocessEncoderSender,
+)
+from streamer.encoder_senders.gstreamer_encoder import GstreamerEncoderSender
 from streamer.get_next_track_from_rainwave import (
     GetNextTrackFromRainwaveBlockingFn,
     MarkTrackInvalidOnRainwaveFireAndForgetFn,
@@ -44,13 +47,11 @@ class AudioPipeline:
         self,
         config: StreamConfig,
         server_connector: AudioSinkConstructor,
-        encoder_sender: EncoderSenderConstructor,
         audio_track: AudioTrackDecoderConstructor,
         get_next_track_from_rainwave: GetNextTrackFromRainwaveBlockingFn,
         mark_track_invalid_on_rainwave: MarkTrackInvalidOnRainwaveFireAndForgetFn,
         should_stop: ShouldStopFn,
-        use_realtime_wait: bool,
-        show_performance: bool,
+        performance_test: bool,
     ) -> None:
         self._config = config
         self._realtime_start = time.monotonic()
@@ -62,16 +63,17 @@ class AudioPipeline:
         self._close_lock = Lock()
         self._closed = False
         self._audio_track = audio_track
-        self._use_realtime_wait = use_realtime_wait
-        self._show_performance = show_performance
+        self._performance_test = performance_test
         self.track_change_counter = 0
 
         try:
             self._encoders.append(
-                encoder_sender(config, "mp3", server_connector, should_stop)
+                GstreamerEncoderSender(config, "mp3", server_connector, should_stop)
             )
             self._encoders.append(
-                encoder_sender(config, "ogg", server_connector, should_stop)
+                FfmpegSubprocessEncoderSender(
+                    config, "ogg", server_connector, should_stop
+                )
             )
         except Exception:
             for encoder in reversed(self._encoders):
@@ -83,7 +85,7 @@ class AudioPipeline:
 
         if frame.samples <= 0:
             return
-        if self._use_realtime_wait and realtime_wait:
+        if not self._performance_test and realtime_wait:
             self._realtime_wait(frame.samples)
 
         for encoder in self._encoders:
@@ -137,6 +139,7 @@ class AudioPipeline:
     ) -> None:
         current_track: TrackDecoder | None = None
         perf_timer = time.monotonic()
+        show_perf_timer = self._performance_test
         try:
             (current_track, _) = self._get_next_track(get_start_buffer=False)
 
@@ -177,11 +180,11 @@ class AudioPipeline:
                 current_track = next_track
                 finished_track.close()
 
-                if self._show_performance and self.track_change_counter > 100:
+                if show_perf_timer and self.track_change_counter > 100:
                     print("Perf: %.2f" % (time.monotonic() - perf_timer))
                     # I only need to see 1 sample for perf testing of the process.
                     # Anything after the first will just be noise.
-                    self._show_performance = False
+                    show_perf_timer = False
 
                 self.track_change_counter += 1
 

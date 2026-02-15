@@ -85,6 +85,6 @@ async def get_next_track_from_robs_ssd() -> TrackInfo:
     path = robs_tracks.pop(0)
     robs_tracks.append(path)
     return TrackInfo(
-        path=f"/mnt/e/Music - VGM/Mega Man X1 (Boxset OST)/{path}",
+        path=path,
         gain_db=-6.27,
     )

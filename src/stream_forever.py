@@ -13,9 +13,9 @@ from streamer.track_decoders.track_decoder import (
     AudioTrackDecoderConstructor,
     TrackInfo,
 )
-from streamer.encoder_senders.encoder_sender import EncoderSenderConstructor
 from streamer.get_next_track_from_rainwave import (
     get_next_track_from_rainwave,
+    get_next_track_from_robs_ssd,
     mark_track_invalid_on_rainwave,
 )
 from streamer.stream_config import StreamConfig
@@ -28,10 +28,8 @@ tracemalloc_frames = 25
 async def stream_forever(
     config: StreamConfig,
     decoder: AudioTrackDecoderConstructor,
-    encoder: EncoderSenderConstructor,
     connection: AudioSinkConstructor,
-    use_realtime_wait: bool,
-    show_performance: bool,
+    performance_test: bool,
 ) -> None:
     loop = asyncio.get_running_loop()
     shutdown_requested = Event()
@@ -40,7 +38,7 @@ async def stream_forever(
     worker: Thread | None = None
     process: psutil.Process | None = None
 
-    if show_performance and not tracemalloc.is_tracing():
+    if performance_test and not tracemalloc.is_tracing():
         tracemalloc.start(tracemalloc_frames)
         process = psutil.Process()
         next_memory_log_at = 0.0
@@ -82,7 +80,8 @@ async def stream_forever(
         if should_stop_workers():
             raise AudioPipelineGracefulShutdownError()
         future = asyncio.run_coroutine_threadsafe(
-            get_next_track_from_rainwave(config.sid), loop
+            (get_next_track_from_robs_ssd()),
+            loop,
         )
         try:
             track_info = future.result(timeout=2.0)
@@ -126,19 +125,17 @@ async def stream_forever(
         pipeline = AudioPipeline(
             audio_track=decoder,
             config=config,
-            encoder_sender=encoder,
             get_next_track_from_rainwave=next_track_blocking,
             mark_track_invalid_on_rainwave=mark_track_invalid_fire_and_forget,
             server_connector=connection,
             should_stop=should_stop_workers,
-            use_realtime_wait=use_realtime_wait,
-            show_performance=show_performance,
+            performance_test=performance_test,
         )
         worker = Thread(target=worker_target, daemon=True, name="AudioPipelineWorker")
         worker.start()
 
         while worker.is_alive():
-            if show_performance:
+            if performance_test:
                 log_memory_usage(pipeline)
             if worker_error:
                 raise worker_error[0]

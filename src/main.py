@@ -5,7 +5,6 @@ import sys
 from typing import Sequence
 
 import cache
-from streamer.encoder_senders.gstreamer_encoder import GstreamerEncoderSender
 from streamer.sinks.gstreamer_sink import GstreamerSink
 from streamer.sinks.null_sink import NullSink
 from streamer.stream_config import StreamConfig
@@ -83,9 +82,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
             config=stream_config,
             connection=NullSink if args.perftest else GstreamerSink,
             decoder=GstreamerTrackDecoder,
-            encoder=GstreamerEncoderSender,
-            show_performance=args.perftest,
-            use_realtime_wait=False if args.perftest else True,
+            performance_test=args.perftest,
         )
     except KeyboardInterrupt:
         pass
