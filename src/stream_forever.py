@@ -35,6 +35,7 @@ async def stream_forever(
     worker_error: list[BaseException] = []
     pipeline: AudioPipeline | None = None
     worker: Thread | None = None
+    first_track: TrackInfo | None = None
     process: psutil.Process | None = None
 
     if performance_test and not tracemalloc.is_tracing():
@@ -109,10 +110,10 @@ async def stream_forever(
         future.add_done_callback(_ignore_mark_result)
 
     def worker_target() -> None:
-        if pipeline is None:
+        if pipeline is None or first_track is None:
             return
         try:
-            pipeline.stream_tracks()
+            pipeline.stream_tracks(first_track)
         except AudioPipelineGracefulShutdownError:
             shutdown_requested.set()
         except Exception as e:
@@ -120,6 +121,8 @@ async def stream_forever(
             shutdown_requested.set()
 
     try:
+        first_track = await get_next_track_from_rainwave(config.sid)
+
         pipeline = AudioPipeline(
             audio_track=decoder,
             config=config,

@@ -9,6 +9,7 @@ import numpy as np
 from streamer.track_decoders.track_decoder import (
     TrackFrame,
     TrackDecoder,
+    TrackInfo,
     AudioTrackDecoderConstructor,
     TrackDecodeError,
     TrackEOFError,
@@ -134,14 +135,18 @@ class AudioPipeline:
                 self._wait_for_retry_or_shutdown(2.0)
             # On any other exception fail-fast.
 
-    def stream_tracks(
-        self,
-    ) -> None:
+    def stream_tracks(self, first_track_info: TrackInfo) -> None:
         current_track: TrackDecoder | None = None
         perf_timer = time.monotonic()
         show_perf_timer = self._performance_test
         try:
-            (current_track, _) = self._get_next_track(get_start_buffer=False)
+            self._raise_if_shutting_down()
+            try:
+                logging.info("Next song queued: %s", first_track_info.path)
+                current_track = self._audio_track(first_track_info)
+            except (TrackDecodeError, TrackOpenError) as e:
+                self._handle_invalid_next_track(e)
+                (current_track, _) = self._get_next_track(get_start_buffer=False)
 
             while True:
                 self._realtime_start = time.monotonic()
