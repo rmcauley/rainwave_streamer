@@ -1,0 +1,16 @@
+[Unit]
+Description=Rainwave Streamer (station %i)
+Requires=rainwave-backend.service
+After=rainwave-backend.service
+
+[Service]
+Type=simple
+User=rainwave
+Group=rainwave
+WorkingDirectory=/home/rainwave/streamer
+ExecStart=/usr/bin/env uv run python src/main.py --sid %i
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
