@@ -1,5 +1,6 @@
 [Unit]
 Description=Rainwave Streamer (station %i)
+Wants=network.target
 Requires=rainwave-backend.service
 After=rainwave-backend.service
 
