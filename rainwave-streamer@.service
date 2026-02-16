@@ -9,7 +9,7 @@ Type=simple
 User=rainwave
 Group=www-data
 WorkingDirectory=/home/rainwave/streamer
-ExecStart=/home/rainwave/streamer/.venv/bin/python3 run python src/main.py --sid %i
+ExecStart=/usr/bin/env uv run python src/main.py --sid %i
 Restart=on-failure
 RestartSec=5
 
