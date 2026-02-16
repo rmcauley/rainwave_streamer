@@ -167,17 +167,6 @@ class GstreamerSink(AudioSink):
             self._pushes_since_poll += 1
             self._poll_gst_messages()
 
-    def reconnect(self) -> None:
-        with self._lock:
-            if self._closed:
-                raise AudioSinkError(f"GStreamer sink {self.mount_path} is closed.")
-            self._pipeline.set_state(Gst.State.NULL)
-            state_result = self._pipeline.set_state(Gst.State.PLAYING)
-            if state_result == Gst.StateChangeReturn.FAILURE:
-                raise AudioSinkError(
-                    f"Failed reconnecting GStreamer sink for {self.mount_path}."
-                )
-
     def close(self) -> None:
         with self._lock:
             if self._closed:

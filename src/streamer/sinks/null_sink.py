@@ -32,14 +32,6 @@ class NullSink(AudioSink):
                 )
             self._bytes_sent += data_len
 
-    def reconnect(self) -> None:
-        with self._lock:
-            if self._closed:
-                raise AudioSinkError(
-                    f"Null sink connection {self.mount_path} is closed."
-                )
-            return
-
     def close(self) -> None:
         with self._lock:
             self._closed = True

@@ -23,10 +23,6 @@ class AudioSink:
         raise NotImplementedError()
 
     @abstractmethod
-    def reconnect(self) -> None:
-        raise NotImplementedError()
-
-    @abstractmethod
     def close(self) -> None:
         raise NotImplementedError()
 

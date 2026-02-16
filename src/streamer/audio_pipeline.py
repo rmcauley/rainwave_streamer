@@ -113,27 +113,24 @@ class AudioPipeline:
     def _get_next_track(
         self, get_start_buffer: bool = True
     ) -> tuple[TrackDecoder, deque[TrackFrame]]:
-        # Attempt to fetch from Rainwave's backend continually until Rainwave responds.
-        while True:
-            self._raise_if_shutting_down()
+        self._raise_if_shutting_down()
 
+        next_track_info = self._get_next_track_from_rainwave()
+        try:
+            next_track = self._audio_track(next_track_info)
             try:
-                next_track_info = self._get_next_track_from_rainwave()
-                next_track = self._audio_track(next_track_info)
-                try:
-                    next_track_start_buffer: deque[TrackFrame] = (
-                        next_track.get_start_buffer() if get_start_buffer else deque()
-                    )
-                except Exception:
-                    next_track.close()
-                    raise
-                logging.info(f"Next song queued: {next_track_info.path}")
-                return (next_track, next_track_start_buffer)
-            except (TrackDecodeError, TrackOpenError) as e:
-                self._handle_invalid_next_track(e)
-                # Wait 2 seconds before trying to fetch again from Rainwave's backend
-                self._wait_for_retry_or_shutdown(2.0)
-            # On any other exception fail-fast.
+                next_track_start_buffer: deque[TrackFrame] = (
+                    next_track.get_start_buffer() if get_start_buffer else deque()
+                )
+            except Exception:
+                next_track.close()
+                raise
+        except (TrackDecodeError, TrackOpenError) as e:
+            self._handle_invalid_next_track(e)
+            raise
+
+        logging.info(f"Next song queued: {next_track_info.path}")
+        return (next_track, next_track_start_buffer)
 
     def stream_tracks(self, first_track_info: TrackInfo) -> None:
         current_track: TrackDecoder | None = None
@@ -146,7 +143,7 @@ class AudioPipeline:
                 current_track = self._audio_track(first_track_info)
             except (TrackDecodeError, TrackOpenError) as e:
                 self._handle_invalid_next_track(e)
-                (current_track, _) = self._get_next_track(get_start_buffer=False)
+                raise
 
             while True:
                 self._realtime_start = time.monotonic()
@@ -159,10 +156,7 @@ class AudioPipeline:
                     pass
                 except TrackDecodeError as e:
                     self._handle_invalid_next_track(e)
-                    # Clearing the audio buffer here will cause the crossfade check to be skipped
-                    # since the resulting frames deque will be 0-length.
-                    current_track.audio_buffer.clear()
-                    current_track.audio_buffer_samples = 0
+                    raise
                 # On any other error, fail fast.
 
                 (next_track, next_track_start) = self._get_next_track()
@@ -395,12 +389,3 @@ class AudioPipeline:
         sleep_time = target_elapsed - elapsed - ahead_buffer_seconds
         if sleep_time > 0:
             time.sleep(sleep_time)
-
-    def _wait_for_retry_or_shutdown(self, seconds: float) -> None:
-        retry_deadline = time.monotonic() + seconds
-        while True:
-            self._raise_if_shutting_down()
-            remaining = retry_deadline - time.monotonic()
-            if remaining <= 0:
-                return
-            time.sleep(min(0.2, remaining))
