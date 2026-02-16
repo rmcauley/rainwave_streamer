@@ -7,7 +7,7 @@ After=rainwave-backend.service
 [Service]
 Type=simple
 User=rainwave
-Group=rainwave
+Group=www-data
 WorkingDirectory=/home/rainwave/streamer
 ExecStart=/home/rainwave/streamer/.venv/bin/python3 run python src/main.py --sid %i
 Restart=on-failure
