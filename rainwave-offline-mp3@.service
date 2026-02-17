@@ -1,0 +1,25 @@
+[Unit]
+Description=Rainwave Offline Streamer (%i.mp3)
+Wants=network.target
+After=network.target
+
+[Service]
+Type=simple
+User=rainwave
+Group=www-data
+WorkingDirectory=/home/rainwave
+ExecStart=/usr/bin/ffmpeg \
+  -loglevel error \
+  -re \
+  -stream_loop -1 \
+  -i /home/rainwave/offline.mp3 \
+  -map 0:a:0 \
+  -c:a copy \
+  -map_metadata -1 \
+  -password PASSWORD \
+  icecast://source@199.27.180.218:8000/offline-%i.mp3
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
