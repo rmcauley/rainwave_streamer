@@ -118,7 +118,7 @@ class FfmpegSubprocessEncoderSender(EncoderSender):
         ]
 
         output_format = "mp3" if codec_name == "mp3" else "ogg"
-        content_type = "audio/mpeg" if codec_name == "mp3" else "application/ogg"
+        content_type = "audio/mpeg" if codec_name == "mp3" else "audio/ogg"
 
         if codec_name == "mp3":
             cmd.extend(

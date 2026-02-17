@@ -62,7 +62,7 @@ class GstreamerSink(AudioSink):
     def _format_caps(self) -> str:
         if self._format == "mp3":
             return "audio/mpeg,mpegversion=(int)1,layer=(int)3"
-        return "application/ogg"
+        return "audio/ogg"
 
     def _build_pipeline(self) -> Any:
         pipeline = Gst.Pipeline.new(f"gstreamer-sink-{self._format}")
