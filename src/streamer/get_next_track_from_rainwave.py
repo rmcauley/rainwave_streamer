@@ -28,9 +28,9 @@ async def get_next_track_from_rainwave(sid: int) -> TrackInfo:
 
             logging.debug(f"From Rainwave:\n{raw_track}")
 
-            _, _, metadata_and_path = raw_track.partition("annotate:")
-            metadata, separator, path = metadata_and_path.rpartition(":")
-            if separator == "" or not path:
+            # annotate:crossfade="1",use_suffix="1",suffix=" [Rainwave Game]",replay_gain="-10.22 dB":/icecast/game--all/The Binding of Isaac: Repentance/03. Juggernaut (Boss Alt).mp3
+            _, metadata, path = raw_track.split(":", 2)
+            if not path:
                 raise Exception("Missing track path from backend response!")
 
             # Safe default till bugs are gone
