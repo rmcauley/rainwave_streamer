@@ -5,12 +5,12 @@ description = "rainwave.cc"
 readme = "README.md"
 requires-python = "~=3.14.0"
 dependencies = [
-    "numpy==2.4.2",
+    "numpy==2.5.5",
     "psutil==7.2.2",
     "types-psutil==7.2.2.20260130",
-    "pygobject==3.54.5",
-    "pygobject-stubs==2.16.0",
-    "emcache>=1.3.3",
+    "pygobject==3.58.1",
+    "pygobject-stubs==2.20.0",
+    "emcache>=1.4.0",
 ]
 
 [build-system]

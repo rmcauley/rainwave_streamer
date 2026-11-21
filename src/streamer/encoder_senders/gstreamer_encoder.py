@@ -141,7 +141,26 @@ class GstreamerEncoderSender(EncoderSender):
         return element
 
     def _disable_tag_metadata(self, element: Any) -> None:
-        if not isinstance(element, Gst.TagSetter):
+        """Disable any tag metadata on a GStreamer element.
+
+        The previous implementation performed a runtime ``isinstance`` check
+        against ``Gst.TagSetter`` which is a ``Protocol`` in the GObject
+        Introspection bindings.  ``Protocol`` types are not runtime
+        checkable unless they are marked ``@runtime_checkable``.  After a
+        GStreamer upgrade this caused type‑checker errors (``mypy`` and
+        Pylance).  Instead of using ``isinstance`` we now perform an
+        attribute‑based check to determine whether the element implements
+        the ``TagSetter`` interface.
+
+        The methods ``reset_tags`` and ``set_tag_merge_mode`` are the only
+        ones we require, so we check for their presence before calling
+        them.  This approach works with any element that implements the
+        ``TagSetter`` protocol (including future GStreamer releases) and
+        satisfies the type checker.
+        """
+        if not (
+            hasattr(element, "reset_tags") and hasattr(element, "set_tag_merge_mode")
+        ):
             return
         # Keep only local (empty) tags so upstream metadata is never forwarded.
         element.reset_tags()

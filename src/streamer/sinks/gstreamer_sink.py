@@ -53,7 +53,16 @@ class GstreamerSink(AudioSink):
         return element
 
     def _disable_tag_metadata(self, element: Any) -> None:
-        if not isinstance(element, Gst.TagSetter):
+        """Disable any tag metadata on a GStreamer element.
+
+        As with the encoder, ``Gst.TagSetter`` is a ``Protocol`` and cannot be
+        used with ``isinstance`` after a recent GStreamer upgrade.  The
+        implementation now checks for the presence of the relevant
+        ``TagSetter`` methods and only proceeds if they exist.
+        """
+        if not (
+            hasattr(element, "reset_tags") and hasattr(element, "set_tag_merge_mode")
+        ):
             return
         # Keep only local (empty) tags so upstream metadata is never forwarded.
         element.reset_tags()

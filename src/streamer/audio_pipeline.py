@@ -159,7 +159,7 @@ class AudioPipeline:
                     raise
                 # On any other error, fail fast.
 
-                (next_track, next_track_start) = self._get_next_track()
+                next_track, next_track_start = self._get_next_track()
 
                 do_crossfade = self._detect_fade(
                     current_track.audio_buffer, direction="out"

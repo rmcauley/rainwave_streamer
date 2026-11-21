@@ -248,6 +248,7 @@ class FfmpegSubprocessEncoderSender(EncoderSender):
                 text = line.decode(errors="replace").rstrip()
                 if text:
                     self._stderr_tail.append(text)
+                    logging.error("ffmpeg %s stderr: %s", self._codec_name, text)
         except Exception as e:
             logging.debug("ffmpeg %s stderr worker failed: %s", self._codec_name, e)
 
